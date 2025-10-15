@@ -20,8 +20,8 @@ load_dotenv()
 from services.pdf_extractor import PDFExtractor
 from services.policy_parser import PolicyParser
 from services.bill_parser import BillParser
-from services.improved_rag_engine import RAGEngine
-from services.improved_compliance_checker import ComplianceChecker
+from services.rag_engine import RAGEngine
+from services.compliance_checker import ComplianceChecker
 from database.mongodb_client import MongoDBClient
 
 # Environment configuration
