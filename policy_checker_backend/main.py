@@ -220,7 +220,7 @@ async def upload_policy(
         logger.info(f"Processing policy upload for company: {company}")
         
         # Validate file
-        await validate_pdf_file(file)
+        # await validate_pdf_file(file)
         file_size = await validate_file_size(file)
         logger.info(f"File size: {file_size/1024:.2f}KB")
 
@@ -314,7 +314,7 @@ async def check_bill(
         logger.info(f"Checking bill compliance for {company}")
         
         # Validate file
-        await validate_pdf_file(file)
+        # await validate_pdf_file(file)
         file_size = await validate_file_size(file)
         logger.info(f"File size: {file_size/1024:.2f}KB")
 
