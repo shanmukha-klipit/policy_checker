@@ -1,15 +1,15 @@
-# services/improved_rag_engine.py - Enhanced RAG with better LLM prompting
+# services/improved_rag_engine.py - Enhanced RAG with Gemini Embeddings
 
 import os
 from typing import List, Dict, Any
 import logging
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
 import numpy as np
 from pymongo import MongoClient
 import google.generativeai as genai
 import json
 import re
+import time
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 class RAGEngine:
     """
     Enhanced RAG Engine with:
+    - Gemini API embeddings (lightweight, no local models)
     - Better prompt engineering
     - Multi-aspect violation detection
     - Improved JSON parsing
@@ -30,11 +31,9 @@ class RAGEngine:
         
         genai.configure(api_key=api_key)
         self.model_name = "gemini-2.0-flash"
-        logger.info(f"Using model: {self.model_name}")
-
-        # Local embeddings
-        logger.info("Loading embedding model...")
-        self.embeddings = SentenceTransformer('all-MiniLM-L6-v2')
+        self.embedding_model = "models/text-embedding-004"  # Latest Gemini embedding model
+        logger.info(f"Using LLM model: {self.model_name}")
+        logger.info(f"Using embedding model: {self.embedding_model}")
 
         # MongoDB - Read from environment variables
         mongo_uri = os.getenv("MONGODB_URI")
@@ -48,15 +47,42 @@ class RAGEngine:
         self.rules_collection = self.db['policy_rules']
         
         logger.info(f"RAG Engine initialized with database: {db_name}")
+        logger.info("✅ Using Gemini embeddings - No heavy ML libraries needed!")
 
     def generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding vector."""
+        """
+        Generate embedding vector using Gemini API.
+        Maintains same function signature as before.
+        """
         try:
-            embedding = self.embeddings.encode(text, convert_to_numpy=True)
-            return embedding.tolist()
+            # Use Gemini's embedding API
+            result = genai.embed_content(
+                model=self.embedding_model,
+                content=text,
+                task_type="retrieval_document"
+            )
+            
+            embedding = result['embedding']
+            
+            # Add small delay to respect rate limits (15/min)
+            time.sleep(0.05)
+            
+            return embedding
+            
         except Exception as e:
-            logger.error(f"Embedding error: {e}")
-            raise
+            logger.error(f"Gemini embedding error: {e}")
+            # Retry once after a delay
+            try:
+                time.sleep(1)
+                result = genai.embed_content(
+                    model=self.embedding_model,
+                    content=text,
+                    task_type="retrieval_document"
+                )
+                return result['embedding']
+            except Exception as retry_error:
+                logger.error(f"Embedding retry failed: {retry_error}")
+                raise
 
     def cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
         """Calculate cosine similarity between vectors."""
