@@ -132,16 +132,11 @@ class PDFExtractor:
         """Extract text from image file (JPG, PNG)."""
         try:
             # Dynamically set tesseract binary path based on environment
-            tesseract_path = os.getenv("TESSERACT_PATH")
-            if tesseract_path:
-                pytesseract.pytesseract.tesseract_cmd = tesseract_path
+           if os.name == "nt":
+                pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
             else:
-                # Default fallbacks for common environments
-                if os.name == "nt":  # Windows
-                    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-                else:  # Linux (Render, Docker, etc.)
-                    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-
+                pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+                
             image = Image.open(image_path)
             text = pytesseract.image_to_string(image)
             logger.info(f"Extracted {len(text)} chars from image")
