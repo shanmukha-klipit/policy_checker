@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: policy-compliance-backend
+    env: python
+    plan: free  # You can change to 'starter' if you need more memory
+    region: oregon  # or 'singapore' for Asia, adjust if you prefer
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PORT
+        value: 10000
+    autoDeploy: true
