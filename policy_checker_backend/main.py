@@ -48,10 +48,7 @@ app = FastAPI(
 )
 
 # CORS configuration
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-]
+ALLOWED_ORIGINS = ["*"]
 
 # Add production origins
 if ENVIRONMENT == "production":
