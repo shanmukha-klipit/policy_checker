@@ -500,7 +500,8 @@ class MongoDBClient:
         Fetch all policy documents for a company.
         """
         try:
-            return list(self.db["policies"].find(
+            # Use policy_rules collection instead of policies
+            policies = list(self.policy_rules.find(
                 {"company": company},
                 {
                     "_id": 1,
@@ -511,13 +512,32 @@ class MongoDBClient:
                     "effective_to": 1,
                     "categories": 1,
                     "total_rules": 1,
-                    "updated_at": 1
+                    "last_updated": 1,  # Changed from updated_at to last_updated
+                    "time_uploaded": 1   # Also include time_uploaded as fallback
                 }
             ))
+            
+            # Format the response
+            formatted_policies = []
+            for policy in policies:
+                formatted_policy = {
+                    "policy_name": policy.get("policy_name"),
+                    "description": policy.get("description", ""),
+                    "status": policy.get("status", "active"),
+                    "effective_from": policy.get("effective_from"),
+                    "effective_to": policy.get("effective_to"),
+                    "total_rules": policy.get("total_rules", 0),
+                    "categories": policy.get("categories", []),
+                    "last_updated": policy.get("last_updated") or policy.get("time_uploaded"),
+                }
+                formatted_policies.append(formatted_policy)
+            
+            logger.info(f"Found {len(formatted_policies)} policies for company: {company}")
+            return formatted_policies
+            
         except Exception as e:
-            self.logger.error(f"Error fetching policies for company={company}: {e}")
+            logger.error(f"Error fetching policies for company={company}: {e}", exc_info=True)
             return []
-
     
     def close(self):
         """Close MongoDB connection."""
