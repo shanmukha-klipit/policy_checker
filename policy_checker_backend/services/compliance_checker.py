@@ -1,6 +1,6 @@
 # services/improved_compliance_checker.py - Comprehensive compliance checking
 
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import logging
 from services.rag_engine import RAGEngine
 from rapidfuzz import fuzz
@@ -27,7 +27,8 @@ class ComplianceChecker:
         self,
         bill_facts: Dict[str, Any],
         company: str,
-        stored_categories: List[str]
+        stored_categories: List[str],
+        policy_name: Optional[str] = None  # ✅ new parameter
     ) -> Dict[str, Any]:
         """
         Comprehensive compliance check:
@@ -75,8 +76,9 @@ class ComplianceChecker:
         relevant_rules = self.rag_engine.retrieve_relevant_rules(
             company=company,
             bill_embedding=bill_embedding,
-            bill_facts=bill_facts,
-            top_k=10  # Retrieve more rules for comprehensive checking
+            bill_facts=bill_facts, 
+            top_k=10,  # Retrieve more rules for comprehensive checking
+            policy_name=policy_name
         )
         
         if not relevant_rules:

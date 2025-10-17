@@ -1,7 +1,7 @@
 # services/improved_rag_engine.py - Enhanced RAG with Gemini Embeddings
 
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 from dotenv import load_dotenv
 import numpy as np
@@ -97,79 +97,107 @@ class RAGEngine:
         company: str,
         bill_embedding: List[float],
         bill_facts: Dict[str, Any],
-        top_k: int = 10
+        top_k: int = 10,
+        policy_name: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Retrieve relevant rules using vector similarity."""
+        """Retrieve relevant rules using vector similarity.
         
-        # Query for the policy document (not individual rules)
-        policy_doc = self.rules_collection.find_one({"company": company, "status": "active"})
-        
-        if not policy_doc:
-            # Try without status filter
-            policy_doc = self.rules_collection.find_one({"company": company})
-        
-        if not policy_doc:
-            logger.warning(f"No policy document found for company={company}")
-            return []
-        
-        # Extract rules from the nested rules_extracted array
-        all_rules = policy_doc.get('rules_extracted', [])
-        
-        if not all_rules:
-            logger.warning(f"No rules found in policy document for company={company}")
-            return []
-        
-        logger.info(f"Found {len(all_rules)} total rules in policy document")
-        
-        # Optional category filter
-        bill_category = bill_facts.get('category', bill_facts.get('bill_meta', {}).get('category'))
-        
-        if bill_category:
-            # Filter rules by category (including "Other" category)
-            filtered_rules = [
-                rule for rule in all_rules 
-                if rule.get('category') in [bill_category, 'Other']
-            ]
-            
-            if filtered_rules:
-                logger.info(f"Filtered to {len(filtered_rules)} rules matching category '{bill_category}' or 'Other'")
-                all_rules = filtered_rules
+        If policy_name is provided → fetch rules from that specific active policy.
+        If not → fetch and merge rules from all active policies for the company.
+        """
+            # --- 1. Fetch policy document(s) ---
+        try:
+            if policy_name:
+                logger.info(f"Fetching rules for company={company}, policy_name={policy_name}")
+                policy_docs = list(self.rules_collection.find({
+                    "company": company,
+                    "policy_name": policy_name,
+                    "status": "active"
+                }))
+                
+                if not policy_docs:
+                    # fallback: try without status filter
+                    policy_docs = list(self.rules_collection.find({
+                        "company": company,
+                        "policy_name": policy_name
+                    }))
             else:
-                logger.warning(f"No rules found for category={bill_category}, using all rules")
+                logger.info(f"Fetching rules for all active policies of company={company}")
+                policy_docs = list(self.rules_collection.find({
+                    "company": company,
+                    "status": "active"
+                }))
+                
+                if not policy_docs:
+                    # fallback: try without status filter
+                    policy_docs = list(self.rules_collection.find({
+                        "company": company
+                    }))
+            
+            if not policy_docs:
+                logger.warning(f"No policy document(s) found for company={company}")
+                return []
 
-        # Score by similarity
-        scored_rules = []
-        for rule in all_rules:
-            if 'embedding' in rule and rule['embedding']:
-                try:
-                    similarity = self.cosine_similarity(bill_embedding, rule['embedding'])
-                    rule['similarity_score'] = similarity
-                    scored_rules.append(rule)
-                except Exception as e:
-                    logger.warning(f"Skipping rule {rule.get('rule_id')}: {e}")
+            # --- 2. Extract and combine rules ---
+            all_rules = []
+            for doc in policy_docs:
+                rules = doc.get('rules_extracted', [])
+                if rules:
+                    all_rules.extend(rules)
 
-        if not scored_rules:
-            # Return rules without scoring
-            logger.warning("No rules with valid embeddings, returning first rules")
-            return all_rules[:top_k]
+            if not all_rules:
+                logger.warning(f"No rules found in policy document(s) for company={company}")
+                return []
 
-        # Sort by similarity
-        scored_rules.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
-        
-        # Also include high-severity rules regardless of similarity
-        high_severity_rules = [r for r in all_rules if r.get('severity') == 'HIGH']
-        
-        # Merge and deduplicate by rule_id
-        top_rules = scored_rules[:top_k]
-        seen_rule_ids = {rule.get('rule_id') for rule in top_rules}
-        
-        for hs_rule in high_severity_rules:
-            if hs_rule.get('rule_id') not in seen_rule_ids and len(top_rules) < top_k * 2:
-                top_rules.append(hs_rule)
-                seen_rule_ids.add(hs_rule.get('rule_id'))
-        
-        logger.info(f"Returning {len(top_rules)} relevant rules")
-        return top_rules[:top_k * 2]  # Return up to 2x top_k to ensure coverage
+            logger.info(f"Collected total {len(all_rules)} rules from {len(policy_docs)} policy document(s)")
+
+            # --- 3. Optional category filtering ---
+            bill_category = bill_facts.get('category', bill_facts.get('bill_meta', {}).get('category'))
+            if bill_category:
+                filtered_rules = [
+                    rule for rule in all_rules
+                    if rule.get('category') in [bill_category, 'Other']
+                ]
+                if filtered_rules:
+                    logger.info(f"Filtered to {len(filtered_rules)} rules matching category '{bill_category}' or 'Other'")
+                    all_rules = filtered_rules
+                else:
+                    logger.warning(f"No rules found for category={bill_category}, using all rules")
+
+            # --- 4. Compute similarity ---
+            scored_rules = []
+            for rule in all_rules:
+                if 'embedding' in rule and rule['embedding']:
+                    try:
+                        similarity = self.cosine_similarity(bill_embedding, rule['embedding'])
+                        rule['similarity_score'] = similarity
+                        scored_rules.append(rule)
+                    except Exception as e:
+                        logger.warning(f"Skipping rule {rule.get('rule_id')}: {e}")
+
+            if not scored_rules:
+                logger.warning("No rules with valid embeddings, returning first rules")
+                return all_rules[:top_k]
+
+            # --- 5. Sort by similarity and merge with high severity rules ---
+            scored_rules.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+            high_severity_rules = [r for r in all_rules if r.get('severity') == 'HIGH']
+
+            top_rules = scored_rules[:top_k]
+            seen_rule_ids = {rule.get('rule_id') for rule in top_rules}
+
+            for hs_rule in high_severity_rules:
+                if hs_rule.get('rule_id') not in seen_rule_ids and len(top_rules) < top_k * 2:
+                    top_rules.append(hs_rule)
+                    seen_rule_ids.add(hs_rule.get('rule_id'))
+
+            logger.info(f"Returning {len(top_rules)} relevant rules")
+            return top_rules[:top_k * 2]
+
+        except Exception as e:
+            logger.error(f"Error retrieving rules for {company}: {e}", exc_info=True)
+            return []
+
 
     def reason_with_llm(
         self,

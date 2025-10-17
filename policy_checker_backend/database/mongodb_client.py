@@ -494,6 +494,30 @@ class MongoDBClient:
         except Exception as e:
             logger.error(f"Error listing policies: {e}")
             return []
+
+    def get_policies_by_company(self, company: str):
+        """
+        Fetch all policy documents for a company.
+        """
+        try:
+            return list(self.db["policies"].find(
+                {"company": company},
+                {
+                    "_id": 1,
+                    "policy_name": 1,
+                    "description": 1,
+                    "status": 1,
+                    "effective_from": 1,
+                    "effective_to": 1,
+                    "categories": 1,
+                    "total_rules": 1,
+                    "updated_at": 1
+                }
+            ))
+        except Exception as e:
+            self.logger.error(f"Error fetching policies for company={company}: {e}")
+            return []
+
     
     def close(self):
         """Close MongoDB connection."""
