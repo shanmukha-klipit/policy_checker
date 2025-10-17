@@ -287,6 +287,7 @@ async def upload_policy(
                 "policy_name": policy_name,
                 "description": description,
                 "rules_count": len(rules),
+                "rules_extracted": rules,
                 "categories": categories,
                 "effective_from": effective_from,
                 "effective_to": effective_to,
