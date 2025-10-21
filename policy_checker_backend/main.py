@@ -13,6 +13,7 @@ from datetime import datetime
 import logging
 import sys
 from dotenv import load_dotenv
+from bson import ObjectId
 
 load_dotenv()
 
@@ -612,7 +613,7 @@ async def update_policy(
     """
     Update an existing policy:
     - If JSON fields are given (description, effective dates, status): only update those.
-    - If file is provided: re-extract rules, categories, and embeddings (like upload), 
+    - If file is provided: re-extract rules, categories, and embeddings (like upload),
       and replace those fields in DB.
     Returns full updated policy document.
     """
@@ -650,29 +651,20 @@ async def update_policy(
                 temp_path = tmp_file.name
 
             try:
-                # Extract text from PDF
                 policy_text = pdf_extractor.extract_text(temp_path)
-
                 if not policy_text or len(policy_text.strip()) < 100:
-                    raise HTTPException(
-                        status_code=400, detail="Could not extract sufficient text from PDF"
-                    )
+                    raise HTTPException(status_code=400, detail="Could not extract sufficient text from PDF")
 
-                # Parse and extract rules
                 parsed_data = policy_parser.parse_policy(policy_text, company)
                 rules = parsed_data["rules"]
                 categories = parsed_data["categories"]
 
                 if not rules:
-                    raise HTTPException(
-                        status_code=400, detail="No rules could be extracted from the uploaded file"
-                    )
+                    raise HTTPException(status_code=400, detail="No rules could be extracted from the uploaded file")
 
-                # Generate embeddings again
                 for rule in rules:
                     rule["embedding"] = rag_engine.generate_embedding(rule["raw_text"])
 
-                # Add rule-related fields
                 updated_fields.update({
                     "file_path": file.filename,
                     "rules_extracted": rules,
@@ -685,33 +677,33 @@ async def update_policy(
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
 
-        # 4️⃣ Always update timestamp
-        updated_fields["updated_at"] = datetime.utcnow()
+        # 4️⃣ Always update timestamp (convert to string for JSON safety)
+        updated_fields["updated_at"] = datetime.utcnow().isoformat()
 
-        # 5️⃣ Update DB partially (preserving untouched fields)
+        # 5️⃣ Update DB partially
         success = db_client.update_policy(company, policy_name, updated_fields)
-
         if not success:
             raise HTTPException(status_code=500, detail="Failed to update policy in database")
 
-        # 6️⃣ Fetch updated policy for full response
+        # 6️⃣ Fetch updated policy
         updated_policy = db_client.get_policy_by_name(company, policy_name)
 
+        # 7️⃣ Convert datetime/ObjectId → JSON-safe
+        def make_json_safe(doc):
+            for k, v in doc.items():
+                if isinstance(v, datetime):
+                    doc[k] = v.isoformat()
+                elif isinstance(v, ObjectId):
+                    doc[k] = str(v)
+            return doc
+
+        updated_policy = make_json_safe(updated_policy)
+
+        # 8️⃣ Return response
         return JSONResponse({
             "status": "success",
             "message": f"Policy '{policy_name}' updated successfully",
-            "company": company,
-            "policy_name": updated_policy.get("policy_name"),
-            "description": updated_policy.get("description", ""),
-            "effective_from": updated_policy.get("effective_from"),
-            "effective_to": updated_policy.get("effective_to"),
-            "total_rules": updated_policy.get("total_rules", 0),
-            "categories": updated_policy.get("categories", []),
-            "rules_extracted": updated_policy.get("rules_extracted", []),
-            "embeddings_model": updated_policy.get("embeddings_model"),
-            "file_path": updated_policy.get("file_path", None),
-            "status": updated_policy.get("status", "active"),
-            "updated_at": updated_policy.get("updated_at"),
+            "data": updated_policy
         })
 
     except HTTPException:
