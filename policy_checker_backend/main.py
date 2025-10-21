@@ -614,6 +614,7 @@ async def update_policy(
     - If JSON fields are given (description, effective dates, status): only update those.
     - If file is provided: re-extract rules, categories, and embeddings (like upload), 
       and replace those fields in DB.
+    Returns full updated policy document.
     """
     try:
         logger.info(f"Updating policy '{policy_name}' for company '{company}'")
@@ -693,10 +694,24 @@ async def update_policy(
         if not success:
             raise HTTPException(status_code=500, detail="Failed to update policy in database")
 
+        # 6️⃣ Fetch updated policy for full response
+        updated_policy = db_client.get_policy_by_name(company, policy_name)
+
         return JSONResponse({
             "status": "success",
             "message": f"Policy '{policy_name}' updated successfully",
-            "updated_fields": list(updated_fields.keys())
+            "company": company,
+            "policy_name": updated_policy.get("policy_name"),
+            "description": updated_policy.get("description", ""),
+            "effective_from": updated_policy.get("effective_from"),
+            "effective_to": updated_policy.get("effective_to"),
+            "total_rules": updated_policy.get("total_rules", 0),
+            "categories": updated_policy.get("categories", []),
+            "rules_extracted": updated_policy.get("rules_extracted", []),
+            "embeddings_model": updated_policy.get("embeddings_model"),
+            "file_path": updated_policy.get("file_path", None),
+            "status": updated_policy.get("status", "active"),
+            "updated_at": updated_policy.get("updated_at"),
         })
 
     except HTTPException:
