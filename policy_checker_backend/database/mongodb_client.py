@@ -538,6 +538,28 @@ class MongoDBClient:
         except Exception as e:
             logger.error(f"Error fetching policies for company={company}: {e}", exc_info=True)
             return []
+        
+    def get_policy_by_name(self, company: str, policy_name: str):
+        try:
+            collection = self.db["policy_rules"]
+            policy = collection.find_one({"company": company, "policy_name": policy_name})
+            return policy
+        except Exception as e:
+            logging.error(f"Error fetching policy by name: {e}")
+            return None
+        
+    def update_policy(self, company: str, policy_name: str, updated_fields: dict):
+        try:
+            result = self.db["policy_rules"].update_one(
+                {"company": company, "policy_name": policy_name},
+                {"$set": updated_fields}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            logging.error(f"Error updating policy: {e}")
+            return False
+
+
     
     def close(self):
         """Close MongoDB connection."""

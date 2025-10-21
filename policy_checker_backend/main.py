@@ -567,6 +567,143 @@ async def list_company_policies(company: str):
     except Exception as e:
         logger.error(f"Error fetching policies for {company}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    
+    
+@app.get("/api/policy/{company}/{policy_name}")
+async def get_policy_by_name(company: str, policy_name: str):
+    """Get a specific policy for a company"""
+    try:
+        policy = db_client.get_policy_by_name(company, policy_name)
+        if not policy:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Policy '{policy_name}' not found for company '{company}'"
+            )
+
+        return JSONResponse({
+            "company": company,
+            "policy_name": policy.get("policy_name"),
+            "description": policy.get("description", ""),
+            "effective_from": policy.get("effective_from"),
+            "effective_to": policy.get("effective_to"),
+            "total_rules": policy.get("total_rules", 0),
+            "categories": policy.get("categories", []),
+            "rules_extracted": policy.get("rules_extracted", []),
+            "embeddings_model": policy.get("embeddings_model"),
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching policy '{policy_name}' for {company}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.put("/api/policy/{company}/{policy_name}")
+async def update_policy(
+    company: str,
+    policy_name: str,
+    file: Optional[UploadFile] = File(None),
+    description: Optional[str] = Form(None),
+    effective_from: Optional[str] = Form(None),
+    effective_to: Optional[str] = Form(None),
+    status: Optional[str] = Form(None),
+):
+    """
+    Update an existing policy:
+    - If JSON fields are given (description, effective dates, status): only update those.
+    - If file is provided: re-extract rules, categories, and embeddings (like upload), 
+      and replace those fields in DB.
+    """
+    try:
+        logger.info(f"Updating policy '{policy_name}' for company '{company}'")
+
+        # 1️⃣ Fetch existing policy
+        existing_policy = db_client.get_policy_by_name(company, policy_name)
+        if not existing_policy:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Policy '{policy_name}' not found for company '{company}'"
+            )
+
+        # 2️⃣ Collect updates
+        updated_fields = {}
+        if description is not None:
+            updated_fields["description"] = description
+        if effective_from is not None:
+            updated_fields["effective_from"] = effective_from
+        if effective_to is not None:
+            updated_fields["effective_to"] = effective_to
+        if status is not None:
+            updated_fields["status"] = status
+
+        # 3️⃣ If file is given → reprocess and replace rules
+        if file:
+            logger.info(f"Re-uploading file for policy '{policy_name}' to re-extract rules")
+            file_size = await validate_file_size(file)
+            logger.info(f"File size: {file_size/1024:.2f}KB")
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                content = await file.read()
+                tmp_file.write(content)
+                temp_path = tmp_file.name
+
+            try:
+                # Extract text from PDF
+                policy_text = pdf_extractor.extract_text(temp_path)
+
+                if not policy_text or len(policy_text.strip()) < 100:
+                    raise HTTPException(
+                        status_code=400, detail="Could not extract sufficient text from PDF"
+                    )
+
+                # Parse and extract rules
+                parsed_data = policy_parser.parse_policy(policy_text, company)
+                rules = parsed_data["rules"]
+                categories = parsed_data["categories"]
+
+                if not rules:
+                    raise HTTPException(
+                        status_code=400, detail="No rules could be extracted from the uploaded file"
+                    )
+
+                # Generate embeddings again
+                for rule in rules:
+                    rule["embedding"] = rag_engine.generate_embedding(rule["raw_text"])
+
+                # Add rule-related fields
+                updated_fields.update({
+                    "file_path": file.filename,
+                    "rules_extracted": rules,
+                    "categories": categories,
+                    "total_rules": len(rules),
+                    "embeddings_model": "sentence-transformers/all-MiniLM-L6-v2"
+                })
+
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+        # 4️⃣ Always update timestamp
+        updated_fields["updated_at"] = datetime.utcnow()
+
+        # 5️⃣ Update DB partially (preserving untouched fields)
+        success = db_client.update_policy(company, policy_name, updated_fields)
+
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update policy in database")
+
+        return JSONResponse({
+            "status": "success",
+            "message": f"Policy '{policy_name}' updated successfully",
+            "updated_fields": list(updated_fields.keys())
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating policy '{policy_name}' for {company}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 # ----------------------------
