@@ -523,6 +523,7 @@ async def delete_policy(company: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 @app.get("/api/policies/{company}")
 async def list_company_policies(company: str):
     """
@@ -538,12 +539,46 @@ async def list_company_policies(company: str):
 
         # Return summarized metadata, not full rules
         response = []
+        current_date = datetime.now().date()
+        
         for p in policies:
+            # Dynamically determine status based on dates
+            effective_from = p.get("effective_from")
+            effective_to = p.get("effective_to")
+            
+            status = "active"  # default
+            
+            if effective_from and effective_to:
+                try:
+                    # Parse dates if they're strings
+                    if isinstance(effective_from, str):
+                        effective_from = datetime.fromisoformat(effective_from.replace('Z', '+00:00')).date()
+                    elif isinstance(effective_from, datetime):
+                        effective_from = effective_from.date()
+                    
+                    if isinstance(effective_to, str):
+                        effective_to = datetime.fromisoformat(effective_to.replace('Z', '+00:00')).date()
+                    elif isinstance(effective_to, datetime):
+                        effective_to = effective_to.date()
+                    
+                    # Determine status
+                    if current_date < effective_from:
+                        status = "inactive"  # or "pending" if you prefer
+                    elif current_date > effective_to:
+                        status = "inactive"  # or "expired"
+                    else:
+                        status = "active"
+                except Exception as date_parse_error:
+                    logger.warning(f"Error parsing dates for policy {p.get('policy_name')}: {date_parse_error}")
+                    status = p.get("status", "active")  # fallback to stored status
+            else:
+                status = p.get("status", "active")  # fallback if dates not present
+            
             response.append(
                 {
                     "policy_name": p.get("policy_name"),
                     "description": p.get("description", ""),
-                    "status": p.get("status", "active"),
+                    "status": status,
                     "effective_from": p.get("effective_from"),
                     "effective_to": p.get("effective_to"),
                     "total_rules": p.get("total_rules", 0),
@@ -581,10 +616,44 @@ async def get_policy_by_name(company: str, policy_name: str):
                 detail=f"Policy '{policy_name}' not found for company '{company}'"
             )
 
+        # Dynamically determine status based on dates
+        current_date = datetime.now().date()
+        effective_from = policy.get("effective_from")
+        effective_to = policy.get("effective_to")
+        
+        status = "active"  # default
+        
+        if effective_from and effective_to:
+            try:
+                # Parse dates if they're strings
+                if isinstance(effective_from, str):
+                    effective_from = datetime.fromisoformat(effective_from.replace('Z', '+00:00')).date()
+                elif isinstance(effective_from, datetime):
+                    effective_from = effective_from.date()
+                
+                if isinstance(effective_to, str):
+                    effective_to = datetime.fromisoformat(effective_to.replace('Z', '+00:00')).date()
+                elif isinstance(effective_to, datetime):
+                    effective_to = effective_to.date()
+                
+                # Determine status
+                if current_date < effective_from:
+                    status = "inactive"  # or "pending"
+                elif current_date > effective_to:
+                    status = "inactive"  # or "expired"
+                else:
+                    status = "active"
+            except Exception as date_parse_error:
+                logger.warning(f"Error parsing dates for policy {policy_name}: {date_parse_error}")
+                status = policy.get("status", "active")  # fallback to stored status
+        else:
+            status = policy.get("status", "active")  # fallback if dates not present
+
         return JSONResponse({
             "company": company,
             "policy_name": policy.get("policy_name"),
             "description": policy.get("description", ""),
+            "status": status,
             "effective_from": policy.get("effective_from"),
             "effective_to": policy.get("effective_to"),
             "total_rules": policy.get("total_rules", 0),
@@ -598,8 +667,8 @@ async def get_policy_by_name(company: str, policy_name: str):
     except Exception as e:
         logger.error(f"Error fetching policy '{policy_name}' for {company}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
+    
+    
 @app.put("/api/policy/{company}/{policy_name}")
 async def update_policy(
     company: str,
