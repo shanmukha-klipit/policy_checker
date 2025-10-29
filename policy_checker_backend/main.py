@@ -689,7 +689,6 @@ async def update_policy(
     try:
         logger.info(f"Updating policy '{policy_name}' for company '{company}'")
 
-        # 1️⃣ Fetch existing policy
         existing_policy = db_client.get_policy_by_name(company, policy_name)
         if not existing_policy:
             raise HTTPException(
@@ -697,7 +696,6 @@ async def update_policy(
                 detail=f"Policy '{policy_name}' not found for company '{company}'"
             )
 
-        # 2️⃣ Collect updates
         updated_fields = {}
         if description is not None:
             updated_fields["description"] = description
@@ -708,7 +706,7 @@ async def update_policy(
         if status is not None:
             updated_fields["status"] = status
 
-        # 3️⃣ If file is given → reprocess and replace rules
+        # 🔄 File reprocessing
         if file:
             logger.info(f"Re-uploading file for policy '{policy_name}' to re-extract rules")
             file_size = await validate_file_size(file)
@@ -746,33 +744,56 @@ async def update_policy(
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
 
-        # 4️⃣ Always update timestamp (convert to string for JSON safety)
         updated_fields["updated_at"] = datetime.utcnow().isoformat()
 
-        # 5️⃣ Update DB partially
         success = db_client.update_policy(company, policy_name, updated_fields)
         if not success:
             raise HTTPException(status_code=500, detail="Failed to update policy in database")
 
-        # 6️⃣ Fetch updated policy
         updated_policy = db_client.get_policy_by_name(company, policy_name)
 
-        # 7️⃣ Convert datetime/ObjectId → JSON-safe
-        def make_json_safe(doc):
-            for k, v in doc.items():
-                if isinstance(v, datetime):
-                    doc[k] = v.isoformat()
-                elif isinstance(v, ObjectId):
-                    doc[k] = str(v)
-            return doc
+        # 🧠 Compute status dynamically (same as get_policy_by_name)
+        current_date = datetime.now().date()
+        effective_from = updated_policy.get("effective_from")
+        effective_to = updated_policy.get("effective_to")
 
-        updated_policy = make_json_safe(updated_policy)
+        computed_status = "active"
+        try:
+            if effective_from and effective_to:
+                if isinstance(effective_from, str):
+                    effective_from = datetime.fromisoformat(effective_from.replace('Z', '+00:00')).date()
+                elif isinstance(effective_from, datetime):
+                    effective_from = effective_from.date()
 
-        # 8️⃣ Return response
+                if isinstance(effective_to, str):
+                    effective_to = datetime.fromisoformat(effective_to.replace('Z', '+00:00')).date()
+                elif isinstance(effective_to, datetime):
+                    effective_to = effective_to.date()
+
+                if current_date < effective_from:
+                    computed_status = "inactive"
+                elif current_date > effective_to:
+                    computed_status = "inactive"
+                else:
+                    computed_status = "active"
+            else:
+                computed_status = updated_policy.get("status", "active")
+        except Exception as e:
+            logger.warning(f"Error parsing dates while computing status for {policy_name}: {e}")
+            computed_status = updated_policy.get("status", "active")
+
+        # ✅ Return in SAME format as get_policy_by_name
         return JSONResponse({
-            "status": "success",
-            "message": f"Policy '{policy_name}' updated successfully",
-            "data": updated_policy
+            "company": company,
+            "policy_name": updated_policy.get("policy_name"),
+            "description": updated_policy.get("description", ""),
+            "status": computed_status,
+            "effective_from": updated_policy.get("effective_from"),
+            "effective_to": updated_policy.get("effective_to"),
+            "total_rules": updated_policy.get("total_rules", 0),
+            "categories": updated_policy.get("categories", []),
+            "rules_extracted": updated_policy.get("rules_extracted", []),
+            "embeddings_model": updated_policy.get("embeddings_model"),
         })
 
     except HTTPException:
