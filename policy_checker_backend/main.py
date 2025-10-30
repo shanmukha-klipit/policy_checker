@@ -532,10 +532,15 @@ async def list_company_policies(company: str):
     try:
         policies = db_client.get_policies_by_company(company)
 
-        if not policies:
-            raise HTTPException(
-                status_code=404, detail=f"No policies found for company: {company}"
-            )
+        if not policies:         
+            return JSONResponse(
+                {
+                    "company": company,
+                    "total_policies": 0,
+                    "policies": []
+                }
+                        
+    )
 
         # Return summarized metadata, not full rules
         response = []
