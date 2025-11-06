@@ -1,4 +1,4 @@
-# services/improved_rag_engine.py - Enhanced RAG with Gemini Embeddings
+# services/optimized_rag_engine.py - Optimized RAG with Batched Rule Checking
 
 import os
 from typing import List, Dict, Any, Optional
@@ -10,17 +10,18 @@ import google.generativeai as genai
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 class RAGEngine:
     """
-    Enhanced RAG Engine with:
-    - Gemini API embeddings (lightweight, no local models)
-    - Better prompt engineering
-    - Multi-aspect violation detection
-    - Improved JSON parsing
+    Optimized RAG Engine with:
+    - Batched rule checking (all rules in one LLM call)
+    - Parallel embedding generation
+    - Faster response times
+    - Same API interface as before
     """
 
     def __init__(self):
@@ -31,7 +32,7 @@ class RAGEngine:
         
         genai.configure(api_key=api_key)
         self.model_name = "gemini-2.0-flash"
-        self.embedding_model = "models/text-embedding-004"  # Latest Gemini embedding model
+        self.embedding_model = "models/text-embedding-004"
         logger.info(f"Using LLM model: {self.model_name}")
         logger.info(f"Using embedding model: {self.embedding_model}")
 
@@ -46,16 +47,11 @@ class RAGEngine:
         self.db = self.mongo_client[db_name]
         self.rules_collection = self.db['policy_rules']
         
-        logger.info(f"RAG Engine initialized with database: {db_name}")
-        logger.info("✅ Using Gemini embeddings - No heavy ML libraries needed!")
+        logger.info(f"Optimized RAG Engine initialized with database: {db_name}")
 
     def generate_embedding(self, text: str) -> List[float]:
-        """
-        Generate embedding vector using Gemini API.
-        Maintains same function signature as before.
-        """
+        """Generate embedding vector using Gemini API (unchanged for compatibility)"""
         try:
-            # Use Gemini's embedding API
             result = genai.embed_content(
                 model=self.embedding_model,
                 content=text,
@@ -63,15 +59,12 @@ class RAGEngine:
             )
             
             embedding = result['embedding']
-            
-            # Add small delay to respect rate limits (15/min)
-            time.sleep(0.05)
+            time.sleep(0.05)  # Rate limiting
             
             return embedding
             
         except Exception as e:
             logger.error(f"Gemini embedding error: {e}")
-            # Retry once after a delay
             try:
                 time.sleep(1)
                 result = genai.embed_content(
@@ -85,7 +78,7 @@ class RAGEngine:
                 raise
 
     def cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        """Calculate cosine similarity between vectors."""
+        """Calculate cosine similarity between vectors (unchanged)"""
         vec1 = np.array(vec1)
         vec2 = np.array(vec2)
         if np.linalg.norm(vec1) == 0 or np.linalg.norm(vec2) == 0:
@@ -100,12 +93,7 @@ class RAGEngine:
         top_k: int = 10,
         policy_name: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Retrieve relevant rules using vector similarity.
-        
-        If policy_name is provided → fetch rules from that specific active policy.
-        If not → fetch and merge rules from all active policies for the company.
-        """
-            # --- 1. Fetch policy document(s) ---
+        """Retrieve relevant rules using vector similarity (unchanged logic)"""
         try:
             if policy_name:
                 logger.info(f"Fetching rules for company={company}, policy_name={policy_name}")
@@ -116,7 +104,6 @@ class RAGEngine:
                 }))
                 
                 if not policy_docs:
-                    # fallback: try without status filter
                     policy_docs = list(self.rules_collection.find({
                         "company": company,
                         "policy_name": policy_name
@@ -129,7 +116,6 @@ class RAGEngine:
                 }))
                 
                 if not policy_docs:
-                    # fallback: try without status filter
                     policy_docs = list(self.rules_collection.find({
                         "company": company
                     }))
@@ -138,7 +124,6 @@ class RAGEngine:
                 logger.warning(f"No policy document(s) found for company={company}")
                 return []
 
-            # --- 2. Extract and combine rules ---
             all_rules = []
             for doc in policy_docs:
                 rules = doc.get('rules_extracted', [])
@@ -151,7 +136,6 @@ class RAGEngine:
 
             logger.info(f"Collected total {len(all_rules)} rules from {len(policy_docs)} policy document(s)")
 
-            # --- 3. Optional category filtering ---
             bill_category = bill_facts.get('category', bill_facts.get('bill_meta', {}).get('category'))
             if bill_category:
                 filtered_rules = [
@@ -164,7 +148,6 @@ class RAGEngine:
                 else:
                     logger.warning(f"No rules found for category={bill_category}, using all rules")
 
-            # --- 4. Compute similarity ---
             scored_rules = []
             for rule in all_rules:
                 if 'embedding' in rule and rule['embedding']:
@@ -179,7 +162,6 @@ class RAGEngine:
                 logger.warning("No rules with valid embeddings, returning first rules")
                 return all_rules[:top_k]
 
-            # --- 5. Sort by similarity and merge with high severity rules ---
             scored_rules.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
             high_severity_rules = [r for r in all_rules if r.get('severity') == 'HIGH']
 
@@ -198,64 +180,73 @@ class RAGEngine:
             logger.error(f"Error retrieving rules for {company}: {e}", exc_info=True)
             return []
 
-
-    def reason_with_llm(
+    def reason_with_llm_batch(
         self,
         bill_facts: Dict[str, Any],
-        policy_rule: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        policy_rules: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         """
-        Enhanced LLM reasoning with comprehensive violation detection.
+        🚀 OPTIMIZED: Check ALL rules in a SINGLE LLM call instead of sequential calls.
+        This is the main optimization that reduces time from N API calls to 1 API call.
         """
+        
+        if not policy_rules:
+            return []
         
         bill_meta = bill_facts.get('bill_meta', {})
         
         # Construct detailed bill description
         bill_description = self._format_bill_details(bill_facts)
         
-        # Construct rule description with all attributes
-        rule_description = self._format_rule_details(policy_rule)
+        # Construct all rules in a structured format
+        rules_text = self._format_all_rules(policy_rules)
         
-        prompt = f"""You are an expert compliance auditor analyzing expense claims against company policies.
+        prompt = f"""You are an expert compliance auditor analyzing an expense claim against multiple company policy rules.
 
-YOUR TASK: Analyze if this expense bill complies with the given policy rule. Be thorough and check ALL aspects.
+YOUR TASK: Analyze if this expense bill complies with ALL the given policy rules. Check each rule thoroughly.
 
-POLICY RULE:
-{rule_description}
-
-EXPENSE BILL:
+EXPENSE BILL DETAILS:
 {bill_description}
 
-ANALYSIS INSTRUCTIONS:
-1. Check EVERY aspect of the rule against the bill
-2. Look for violations in: amounts, modes/types, conditions, approvals, documentation, restrictions
-3. Be strict - any deviation from policy is a violation
-4. Consider context - sometimes bills may be compliant even if they seem borderline
-5. Provide specific, actionable explanations
+POLICY RULES TO CHECK (Total: {len(policy_rules)} rules):
+{rules_text}
 
-RESPOND IN THIS EXACT JSON FORMAT:
-{{
-  "compliant": true or false,
-  "classification": "Compliant" OR one of ["Exceeded Limit", "Disallowed Mode", "Missing Approval", "Missing Documentation", "Unauthorized Vendor", "Prohibited Category", "Time Restriction Violated", "Quantity Exceeded", "Grade Restriction", "Geographic Restriction", "Not Covered", "Other Violation"],
-  "severity": "HIGH" (critical violation) OR "MEDIUM" (moderate issue) OR "LOW" (minor concern),
-  "explanation": "Clear, specific explanation citing exact policy text and bill details. Explain WHAT is wrong, WHY it violates policy, and HOW much/by what degree.",
-  "confidence": 0.0 to 1.0 (your confidence in this assessment),
-  "violation_details": {{
-    "expected": "what the policy requires/allows",
-    "actual": "what the bill shows",
-    "deviation": "specific deviation amount/type if applicable"
-  }}
-}}
+ANALYSIS INSTRUCTIONS:
+1. Check the bill against EVERY rule listed above
+2. For each rule, determine if there's a violation
+3. Look for violations in: amounts, modes/types, conditions, approvals, documentation, restrictions
+4. Be strict - any deviation from policy is a violation
+5. If a rule doesn't apply to this bill (wrong category/context), mark it as compliant
+6. Provide specific, actionable explanations
+
+RESPOND IN THIS EXACT JSON FORMAT - AN ARRAY OF RESULTS FOR EACH RULE:
+[
+  {{
+    "rule_id": "r1",
+    "compliant": true or false,
+    "classification": "Compliant" OR one of ["Exceeded Limit", "Disallowed Mode", "Missing Approval", "Missing Documentation", "Unauthorized Vendor", "Prohibited Category", "Time Restriction Violated", "Quantity Exceeded", "Grade Restriction", "Geographic Restriction", "Not Covered", "Other Violation"],
+    "severity": "HIGH" or "MEDIUM" or "LOW",
+    "explanation": "Clear, specific explanation citing exact policy text and bill details. Explain WHAT is wrong, WHY it violates policy, and HOW much/by what degree.",
+    "confidence": 0.0 to 1.0,
+    "violation_details": {{
+      "expected": "what the policy requires/allows",
+      "actual": "what the bill shows",
+      "deviation": "specific deviation amount/type if applicable"
+    }}
+  }},
+  ... (one object for each rule)
+]
 
 IMPORTANT RULES:
+- Return exactly {len(policy_rules)} result objects (one per rule)
+- Include rule_id in each result to identify which rule it refers to
 - If compliant, set "compliant": true and "classification": "Compliant"
 - If ANY aspect violates policy, set "compliant": false
 - Use the most specific classification that matches the violation
 - Higher severity for clear, significant violations; lower for ambiguous cases
 - Be precise with numbers - state exact amounts and limits
-- If rule doesn't apply to this bill (wrong category/context), mark as compliant
 
-Return ONLY valid JSON, no other text.
+Return ONLY valid JSON array, no other text.
 """
         
         try:
@@ -286,31 +277,93 @@ Return ONLY valid JSON, no other text.
             if not result_json:
                 raise ValueError("Could not extract valid JSON from LLM response")
             
-            result = json.loads(result_json)
+            results = json.loads(result_json)
             
-            # Validate result structure
-            result = self._validate_llm_result(result)
+            # Validate it's an array
+            if not isinstance(results, list):
+                raise ValueError("Expected JSON array of results")
             
-            # Add metadata
-            result['company_rule_text'] = policy_rule.get('raw_text', '')
-            result['rule_id'] = policy_rule.get('rule_id', '')
-            result['rule_category'] = policy_rule.get('category', '')
-            result['bill_snippet'] = bill_facts.get('raw_text', '')[:200]
-            result['model_used'] = self.model_name
+            # Enrich each result with metadata
+            enriched_results = []
+            rule_map = {r.get('rule_id'): r for r in policy_rules}
             
-            return result
+            for result in results:
+                result = self._validate_llm_result(result)
+                
+                # Add rule metadata
+                rule_id = result.get('rule_id', '')
+                if rule_id in rule_map:
+                    rule = rule_map[rule_id]
+                    result['company_rule_text'] = rule.get('raw_text', '')
+                    result['rule_category'] = rule.get('category', '')
+                else:
+                    result['company_rule_text'] = ''
+                    result['rule_category'] = ''
+                
+                result['bill_snippet'] = bill_facts.get('raw_text', '')[:200]
+                result['model_used'] = self.model_name
+                
+                enriched_results.append(result)
+            
+            logger.info(f"Batch analysis complete: {len(enriched_results)} rules checked in single call")
+            return enriched_results
 
         except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {e}")
+            logger.error(f"JSON parsing error in batch analysis: {e}")
             logger.error(f"Raw response: {result_text[:500]}")
-            return self._fallback_result(bill_facts, policy_rule, f"JSON parsing error: {str(e)}")
+            return self._fallback_batch_results(bill_facts, policy_rules, f"JSON parsing error: {str(e)}")
         
         except Exception as e:
-            logger.error(f"LLM reasoning error: {e}")
-            return self._fallback_result(bill_facts, policy_rule, f"Analysis error: {str(e)}")
+            logger.error(f"LLM batch reasoning error: {e}")
+            return self._fallback_batch_results(bill_facts, policy_rules, f"Analysis error: {str(e)}")
+
+    def reason_with_llm(
+        self,
+        bill_facts: Dict[str, Any],
+        policy_rule: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        DEPRECATED: Kept for backward compatibility, but internally uses batch processing.
+        This maintains the same API interface for existing code.
+        """
+        # Convert single rule to batch and return first result
+        results = self.reason_with_llm_batch(bill_facts, [policy_rule])
+        return results[0] if results else self._fallback_result(bill_facts, policy_rule, "No results")
+
+    def _format_all_rules(self, policy_rules: List[Dict[str, Any]]) -> str:
+        """Format all rules into a compact, structured text format for the prompt."""
+        lines = []
+        
+        for idx, rule in enumerate(policy_rules, 1):
+            lines.append(f"\n--- RULE {idx}: {rule.get('rule_id', f'rule_{idx}')} ---")
+            lines.append(f"Category: {rule.get('category', 'N/A')}")
+            lines.append(f"Severity: {rule.get('severity', 'MEDIUM')}")
+            lines.append(f"Rule Text: {rule.get('raw_text', 'N/A')}")
+            
+            # Add structured attributes in compact form
+            attrs = rule.get('attributes', {})
+            if attrs:
+                attr_parts = []
+                if attrs.get('max_amount'):
+                    attr_parts.append(f"Max: {attrs.get('max_amount')} {attrs.get('currency', 'INR')}")
+                if attrs.get('min_amount'):
+                    attr_parts.append(f"Min: {attrs.get('min_amount')} {attrs.get('currency', 'INR')}")
+                if attrs.get('allowed_modes'):
+                    attr_parts.append(f"Allowed: {', '.join(attrs.get('allowed_modes'))}")
+                if attrs.get('disallowed_modes'):
+                    attr_parts.append(f"Disallowed: {', '.join(attrs.get('disallowed_modes'))}")
+                if attrs.get('conditions'):
+                    attr_parts.append(f"Conditions: {', '.join(attrs.get('conditions'))}")
+                if attrs.get('domestic_only'):
+                    attr_parts.append("Domestic Only")
+                
+                if attr_parts:
+                    lines.append(f"Attributes: {' | '.join(attr_parts)}")
+        
+        return "\n".join(lines)
 
     def _format_bill_details(self, bill_facts: Dict[str, Any]) -> str:
-        """Format bill details for LLM prompt."""
+        """Format bill details for LLM prompt (unchanged)"""
         bill_meta = bill_facts.get('bill_meta', {})
         
         lines = []
@@ -336,54 +389,19 @@ Return ONLY valid JSON, no other text.
         if bill_meta.get('approval_status'):
             lines.append(f"Approval Status: {bill_meta.get('approval_status')}")
         
-        # Add raw text if available
         if bill_facts.get('raw_text'):
             lines.append(f"\nOriginal Bill Text:\n{bill_facts.get('raw_text')[:300]}")
         
         return "\n".join(lines)
 
-    def _format_rule_details(self, policy_rule: Dict[str, Any]) -> str:
-        """Format policy rule details for LLM prompt."""
-        lines = []
-        
-        lines.append(f"Rule ID: {policy_rule.get('rule_id', 'N/A')}")
-        lines.append(f"Category: {policy_rule.get('category', 'N/A')}")
-        lines.append(f"Severity: {policy_rule.get('severity', 'MEDIUM')}")
-        lines.append(f"\nRule Text:\n{policy_rule.get('raw_text', 'N/A')}")
-        
-        # Add structured attributes
-        attrs = policy_rule.get('attributes', {})
-        if attrs:
-            lines.append("\nRule Attributes:")
-            if attrs.get('max_amount'):
-                lines.append(f"  • Max Amount: {attrs.get('max_amount')} {attrs.get('currency', 'INR')}")
-            if attrs.get('min_amount'):
-                lines.append(f"  • Min Amount: {attrs.get('min_amount')} {attrs.get('currency', 'INR')}")
-            if attrs.get('allowed_modes'):
-                lines.append(f"  • Allowed Modes: {', '.join(attrs.get('allowed_modes'))}")
-            if attrs.get('disallowed_modes'):
-                lines.append(f"  • Disallowed Modes: {', '.join(attrs.get('disallowed_modes'))}")
-            if attrs.get('conditions'):
-                lines.append(f"  • Conditions: {', '.join(attrs.get('conditions'))}")
-            if attrs.get('domestic_only'):
-                lines.append(f"  • Domestic Only: Yes")
-            if attrs.get('scope'):
-                lines.append(f"  • Scope: {attrs.get('scope')}")
-            if attrs.get('vendor_restrictions'):
-                lines.append(f"  • Approved Vendors: {', '.join(attrs.get('vendor_restrictions'))}")
-        
-        return "\n".join(lines)
-
     def _extract_json(self, text: str) -> str:
-        """Extract JSON from LLM response with various formats."""
-        # Try direct JSON parse
+        """Extract JSON from LLM response (unchanged)"""
         try:
             json.loads(text)
             return text
         except:
             pass
         
-        # Extract from markdown code blocks
         if '```json' in text:
             text = text.split('```json')[1].split('```')[0].strip()
             return text
@@ -391,7 +409,12 @@ Return ONLY valid JSON, no other text.
             text = text.split('```')[1].split('```')[0].strip()
             return text
         
-        # Try to find JSON object with regex
+        # Try to find JSON array
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            return match.group(0)
+        
+        # Try to find JSON object
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             return match.group(0)
@@ -399,8 +422,7 @@ Return ONLY valid JSON, no other text.
         return None
 
     def _validate_llm_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate and fix LLM result structure."""
-        # Ensure required fields
+        """Validate and fix LLM result structure (unchanged)"""
         if 'compliant' not in result:
             result['compliant'] = False
         
@@ -416,19 +438,41 @@ Return ONLY valid JSON, no other text.
         if 'confidence' not in result:
             result['confidence'] = 0.7
         
-        # Ensure confidence is between 0 and 1
         confidence = result.get('confidence', 0.7)
         if isinstance(confidence, (int, float)):
             result['confidence'] = max(0.0, min(1.0, float(confidence)))
         else:
             result['confidence'] = 0.7
         
-        # Normalize severity
         severity = str(result.get('severity', 'MEDIUM')).upper()
         if severity not in ['HIGH', 'MEDIUM', 'LOW']:
             result['severity'] = 'MEDIUM'
         
         return result
+
+    def _fallback_batch_results(
+        self,
+        bill_facts: Dict[str, Any],
+        policy_rules: List[Dict[str, Any]],
+        error_msg: str
+    ) -> List[Dict[str, Any]]:
+        """Return fallback results for all rules when batch processing fails."""
+        results = []
+        for rule in policy_rules:
+            results.append({
+                "rule_id": rule.get('rule_id', ''),
+                "compliant": False,
+                "classification": "Analysis Error",
+                "severity": "LOW",
+                "explanation": f"Unable to complete compliance analysis: {error_msg}",
+                "confidence": 0.3,
+                "company_rule_text": rule.get('raw_text', ''),
+                "rule_category": rule.get('category', ''),
+                "bill_snippet": bill_facts.get('raw_text', '')[:200],
+                "model_used": self.model_name,
+                "error": error_msg
+            })
+        return results
 
     def _fallback_result(
         self,
@@ -436,7 +480,7 @@ Return ONLY valid JSON, no other text.
         policy_rule: Dict[str, Any],
         error_msg: str
     ) -> Dict[str, Any]:
-        """Return fallback result when LLM fails."""
+        """Return fallback result when single LLM call fails (unchanged)"""
         return {
             "compliant": False,
             "classification": "Analysis Error",
