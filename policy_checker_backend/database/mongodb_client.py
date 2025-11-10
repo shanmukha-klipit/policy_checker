@@ -559,6 +559,62 @@ class MongoDBClient:
             logging.error(f"Error updating policy: {e}")
             return False
 
+    def get_expense_by_id(self, expense_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve an expense from manual_expenses collection by ID.
+        
+        Args:
+            expense_id: The expense document ID (string or ObjectId)
+        
+        Returns:
+            Dict containing expense data or None if not found
+        """
+        try:
+            from bson import ObjectId
+            
+            # Access manual_expenses collection
+            manual_expenses = self.db['manual_expenses']
+            
+            # Try to convert string ID to ObjectId
+            try:
+                expense_object_id = ObjectId(expense_id)
+                expense = manual_expenses.find_one({"_id": expense_object_id})
+            except Exception:
+                # If conversion fails, try searching with string ID
+                expense = manual_expenses.find_one({"_id": expense_id})
+            
+            if not expense:
+                logger.warning(f"Expense not found with ID: {expense_id}")
+                return None
+            
+            # Convert ObjectId to string for JSON serialization
+            if '_id' in expense:
+                expense['_id'] = str(expense['_id'])
+            
+            # Extract relevant fields
+            expense_data = {
+                "_id": expense.get("_id"),
+                "title": expense.get("title"),
+                "date": expense.get("date"),
+                "currency": expense.get("currency"),
+                "originalAmount": expense.get("originalAmount"),
+                "totalAmount": expense.get("totalAmount"),
+                "convertedCurrency": expense.get("convertedCurrency"),
+                "items": expense.get("items", []),
+                "receiptId": expense.get("receiptId"),
+                "retailer": expense.get("retailer"),
+                "time": expense.get("time"),
+                "fileUrl": expense.get("fileUrl"),
+                "status": expense.get("status"),
+                "numberOfItems": expense.get("numberOfItems", 0),
+            }
+            
+            logger.info(f"Retrieved expense: {expense_data.get('title')} with {len(expense_data.get('items', []))} items")
+            return expense_data
+            
+        except Exception as e:
+            logger.error(f"Error retrieving expense by ID: {e}", exc_info=True)
+            return None
 
     
     def close(self):

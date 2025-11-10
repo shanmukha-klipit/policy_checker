@@ -201,53 +201,62 @@ class RAGEngine:
         # Construct all rules in a structured format
         rules_text = self._format_all_rules(policy_rules)
         
+
+        
         prompt = f"""You are an expert compliance auditor analyzing an expense claim against multiple company policy rules.
 
-YOUR TASK: Analyze if this expense bill complies with ALL the given policy rules. Check each rule thoroughly.
+        YOUR TASK: Analyze if this expense bill complies with ALL the given policy rules. Check each rule thoroughly.
 
-EXPENSE BILL DETAILS:
-{bill_description}
+        EXPENSE BILL DETAILS:
+        {bill_description}
 
-POLICY RULES TO CHECK (Total: {len(policy_rules)} rules):
-{rules_text}
+        POLICY RULES TO CHECK (Total: {len(policy_rules)} rules):
+        {rules_text}
 
-ANALYSIS INSTRUCTIONS:
-1. Check the bill against EVERY rule listed above
-2. For each rule, determine if there's a violation
-3. Look for violations in: amounts, modes/types, conditions, approvals, documentation, restrictions
-4. Be strict - any deviation from policy is a violation
-5. If a rule doesn't apply to this bill (wrong category/context), mark it as compliant
-6. Provide specific, actionable explanations
+        ANALYSIS INSTRUCTIONS:
+        1. Check the bill against EVERY rule listed above
+        2. For each rule, determine if there's a violation
+        3. Look for violations in: amounts, modes/types, conditions, approvals, documentation, restrictions
+        4. **CRITICAL FOR TIME RESTRICTIONS**: 
+        - Check if bill submission date exceeds policy time limits
+        - Calculate days between bill date and current date
+        - If policy says "within X days" and bill is older, it's a violation
+        - Example: Bill from 2025-06-15, today is 2025-11-10 = 148 days old
+        - If policy says "within 30 days", this violates the rule
+        5. Be strict - any deviation from policy is a violation
+        6. If a rule doesn't apply to this bill (wrong category/context), mark it as compliant
+        7. Provide specific, actionable explanations with exact dates and calculations
 
-RESPOND IN THIS EXACT JSON FORMAT - AN ARRAY OF RESULTS FOR EACH RULE:
-[
-  {{
-    "rule_id": "r1",
-    "compliant": true or false,
-    "classification": "Compliant" OR one of ["Exceeded Limit", "Disallowed Mode", "Missing Approval", "Missing Documentation", "Unauthorized Vendor", "Prohibited Category", "Time Restriction Violated", "Quantity Exceeded", "Grade Restriction", "Geographic Restriction", "Not Covered", "Other Violation"],
-    "severity": "HIGH" or "MEDIUM" or "LOW",
-    "explanation": "Clear, specific explanation citing exact policy text and bill details. Explain WHAT is wrong, WHY it violates policy, and HOW much/by what degree.",
-    "confidence": 0.0 to 1.0,
-    "violation_details": {{
-      "expected": "what the policy requires/allows",
-      "actual": "what the bill shows",
-      "deviation": "specific deviation amount/type if applicable"
-    }}
-  }},
-  ... (one object for each rule)
-]
+        RESPOND IN THIS EXACT JSON FORMAT - AN ARRAY OF RESULTS FOR EACH RULE:
+        [
+        {{
+            "rule_id": "r1",
+            "compliant": true or false,
+            "classification": "Compliant" OR one of ["Exceeded Limit", "Disallowed Mode", "Missing Approval", "Missing Documentation", "Unauthorized Vendor", "Prohibited Category", "Time Restriction Violated", "Quantity Exceeded", "Grade Restriction", "Geographic Restriction", "Not Covered", "Other Violation"],
+            "severity": "HIGH" or "MEDIUM" or "LOW",
+            "explanation": "Clear, specific explanation citing exact policy text and bill details. For time violations: state bill date, current date, days elapsed, and policy limit.",
+            "confidence": 0.0 to 1.0,
+            "violation_details": {{
+            "expected": "what the policy requires/allows",
+            "actual": "what the bill shows",
+            "deviation": "specific deviation amount/type/days if applicable"
+            }}
+        }},
+        ... (one object for each rule)
+        ]
 
-IMPORTANT RULES:
-- Return exactly {len(policy_rules)} result objects (one per rule)
-- Include rule_id in each result to identify which rule it refers to
-- If compliant, set "compliant": true and "classification": "Compliant"
-- If ANY aspect violates policy, set "compliant": false
-- Use the most specific classification that matches the violation
-- Higher severity for clear, significant violations; lower for ambiguous cases
-- Be precise with numbers - state exact amounts and limits
+        IMPORTANT RULES:
+        - Return exactly {len(policy_rules)} result objects (one per rule)
+        - Include rule_id in each result to identify which rule it refers to
+        - If compliant, set "compliant": true and "classification": "Compliant"
+        - If ANY aspect violates policy, set "compliant": false
+        - For time violations, use classification "Time Restriction Violated"
+        - Use the most specific classification that matches the violation
+        - Higher severity for clear, significant violations; lower for ambiguous cases
+        - Be precise with numbers and dates - state exact amounts, limits, and time calculations
 
-Return ONLY valid JSON array, no other text.
-"""
+        Return ONLY valid JSON array, no other text.
+        """
         
         try:
             model = genai.GenerativeModel(self.model_name)
@@ -363,19 +372,40 @@ Return ONLY valid JSON array, no other text.
         return "\n".join(lines)
 
     def _format_bill_details(self, bill_facts: Dict[str, Any]) -> str:
-        """Format bill details for LLM prompt (unchanged)"""
+        """Format bill details for LLM prompt"""
         bill_meta = bill_facts.get('bill_meta', {})
         
         lines = []
         lines.append(f"Category: {bill_meta.get('category', 'N/A')}")
         lines.append(f"Amount: {bill_meta.get('amount', 'N/A')} {bill_meta.get('currency', 'INR')}")
         
+        # IMPORTANT: Include the bill date prominently for time restriction checks
+        if bill_meta.get('date'):
+            bill_date = bill_meta.get('date')
+            lines.append(f"Bill Date: {bill_date}")
+            
+            # Calculate age of bill for time restriction analysis
+            try:
+                from datetime import datetime
+                if isinstance(bill_date, str):
+                    bill_date_obj = datetime.fromisoformat(bill_date.replace('Z', '+00:00'))
+                else:
+                    bill_date_obj = bill_date
+                
+                current_date = datetime.utcnow()
+                days_old = (current_date - bill_date_obj).days
+                
+                lines.append(f"Bill Age: {days_old} days old (submitted on {current_date.strftime('%Y-%m-%d')})")
+                
+                logger.info(f"🕒 Bill Date: {bill_date}, Current: {current_date.strftime('%Y-%m-%d')}, Age: {days_old} days")
+                
+            except Exception as e:
+                logger.warning(f"Could not calculate bill age: {e}")
+        
         if bill_meta.get('mode'):
             lines.append(f"Mode/Type: {bill_meta.get('mode')}")
         if bill_meta.get('vendor'):
             lines.append(f"Vendor: {bill_meta.get('vendor')}")
-        if bill_meta.get('date'):
-            lines.append(f"Date: {bill_meta.get('date')}")
         if bill_meta.get('origin'):
             lines.append(f"Origin: {bill_meta.get('origin')}")
         if bill_meta.get('destination'):
