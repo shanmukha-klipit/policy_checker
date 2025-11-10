@@ -615,6 +615,10 @@ class MongoDBClient:
         except Exception as e:
             logger.error(f"Error retrieving expense by ID: {e}", exc_info=True)
             return None
+        
+    def get_compliance_by_expense_id(self, expense_id: str):
+        """Fetch compliance result if already exists for this expense"""
+        return self.compliance_checks.find_one({"expense_id": expense_id})
 
     
     def close(self):

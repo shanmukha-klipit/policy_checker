@@ -14,6 +14,7 @@ from datetime import datetime
 import logging
 import sys
 from dotenv import load_dotenv
+from bson import ObjectId
 
 load_dotenv()
 
@@ -508,13 +509,28 @@ async def upload_policy(
         logger.error(f"Error processing policy: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+def make_json_safe(doc):
+    """
+    Recursively convert ObjectId and datetime values in a MongoDB document
+    into JSON-serializable strings.
+    """
+    if isinstance(doc, list):
+        return [make_json_safe(i) for i in doc]
+    elif isinstance(doc, dict):
+        return {k: make_json_safe(v) for k, v in doc.items()}
+    elif isinstance(doc, ObjectId):
+        return str(doc)
+    elif isinstance(doc, datetime):
+        return doc.isoformat()
+    else:
+        return doc
+
+
 @app.post("/api/bill/check/expense")
 async def check_bill_from_expense(request: BillCheckExpenseRequest):
     """
-    ✅ FIXED: Check bill compliance from manual expense ID.
-    
-    Uses direct JSON-to-bill_facts conversion (no text parsing).
-    This preserves all structured data and maintains consistency with PDF uploads.
+    ✅ Enhanced: Check bill compliance from manual expense ID.
+    Includes caching logic and JSON-safe serialization.
     """
     try:
         logger.info(
@@ -522,30 +538,59 @@ async def check_bill_from_expense(request: BillCheckExpenseRequest):
             f"expense_id={request.expense_id}, policy_name={request.policy_name or 'ALL'}"
         )
 
-        # Fetch expense from manual_expenses collection
+        # 1️⃣ Check if compliance already exists
+        existing_check = db_client.get_compliance_by_expense_id(request.expense_id)
+        if existing_check:
+            logger.info("♻️ Existing compliance check found — returning cached result")
+
+            existing_check = make_json_safe(existing_check)
+            metadata = existing_check.get("metadata", {})
+            classification = existing_check.get("classification", {})
+            violations = existing_check.get("violations", [])
+            overall_score = classification.get("compliance_score", 0)
+
+            response = {
+                "company": existing_check.get("company"),
+                "expense_id": existing_check.get("expense_id"),
+                "bill_id": existing_check.get("bill_id"),
+                "source": existing_check.get("source"),
+                "expense_title": metadata.get("expense_title"),
+                "expense_date": metadata.get("expense_date"),
+                "currency": metadata.get("currency"),
+                "original_amount": metadata.get("original_amount"),
+                "total_amount": metadata.get("original_amount"),
+                "item_count": metadata.get("item_count"),
+                "policy_name": existing_check.get("policy_name"),
+                "overall_score": overall_score,
+                "is_compliant": classification.get("non_compliant_items", 0) == 0,
+                "category_info": {
+                    "bill_category": metadata.get("bill_category"),
+                    "matched_category": metadata.get("matched_category"),
+                    "similarity": metadata.get("similarity"),
+                },
+                "mismatch_count": existing_check.get("total_violations", len(violations)),
+                "severity_breakdown": existing_check.get("violations_by_severity", {}),
+                "mismatches": violations,
+                "summary": f"Compliance score: {overall_score}",
+            }
+
+            return JSONResponse(make_json_safe(response))
+
+        # 2️⃣ Fetch expense
         expense = db_client.get_expense_by_id(request.expense_id)
-        
         if not expense:
             raise HTTPException(
                 status_code=404,
                 detail=f"Expense not found with ID: {request.expense_id}"
             )
-        
+
         logger.info(f"📄 Found expense: {expense.get('title', 'N/A')}")
 
-        # ✅ KEY FIX: Direct conversion instead of text extraction
+        # 3️⃣ Convert expense → bill facts
         bill_facts = convert_expense_to_bill_facts(expense)
-        
-        logger.info(f"📋 Bill facts structure: {bill_facts.get('bill_id')}, "
-                    f"category={bill_facts['bill_meta'].get('category')}, "
-                    f"amount={bill_facts['bill_meta'].get('amount')}, "
-                    f"items={bill_facts['bill_meta'].get('item_count')}")
-        
-        # Ensure correct date for compliance checking
         bill_facts['bill_meta']['date'] = format_date(expense.get("date"))
-        logger.info(f"📅 Bill date for compliance check: {bill_facts['bill_meta']['date']}")
 
-        # Get stored categories
+        # 4️⃣ Fetch policy categories
         stored_categories = db_client.get_allowed_categories(request.company)
         if not stored_categories:
             raise HTTPException(
@@ -553,7 +598,7 @@ async def check_bill_from_expense(request: BillCheckExpenseRequest):
                 detail=f"No policy found for company: {request.company}. Please upload policy first.",
             )
 
-        # Run compliance check (optimized batch processing)
+        # 5️⃣ Run compliance check
         compliance_result = compliance_checker.check_compliance(
             bill_facts=bill_facts,
             company=request.company,
@@ -561,76 +606,73 @@ async def check_bill_from_expense(request: BillCheckExpenseRequest):
             policy_name=request.policy_name,
         )
 
-        # Generate report
+        # 6️⃣ Generate report
         report = compliance_checker.generate_detailed_report(compliance_result)
 
-        # Store compliance check
-        db_client.store_compliance_check(
-            {
-                "company": request.company,
-                "file_path": expense.get("fileUrl"),
-                "source": "manual_expense",
-                "expense_id": request.expense_id,
-                "violations": report["violations"],
-                "classification": {
-                    "compliant_items": 1 if report["is_compliant"] else 0,
-                    "non_compliant_items": 0 if report["is_compliant"] else 1,
-                    "total_items": 1,
-                    "compliance_score": report["compliance_score"],
-                    "categories_checked": stored_categories,
-                },
-                "bill_id": bill_facts.get("bill_id"),
-                "policy_name": request.policy_name,
-                "metadata": {
-                    "bill_category": report["category_info"]["bill_category"],
-                    "matched_category": report["category_info"]["matched_category"],
-                    "similarity": report["category_info"]["similarity"],
-                    "source_type": "manual_expense",
-                    "expense_title": expense.get("title"),
-                    "expense_date": expense.get("date"),
-                    "currency": expense.get("currency"),
-                    "original_amount": expense.get("originalAmount"),
-                    "item_count": len(expense.get("items", [])),
-                },
-            }
-        )
-
-        logger.info(f"✅ Compliance check completed. Score: {report['compliance_score']}")
-
-        # Convert datetime to ISO string for JSON serialization
-        expense_date = expense.get("date")
-        if isinstance(expense_date, datetime):
-            expense_date = expense_date.isoformat()
-        
-        return JSONResponse(
-            {
-                "company": request.company,
-                "expense_id": request.expense_id,
-                "bill_id": bill_facts.get("bill_id"),
-                "source": "manual_expense",
+        # 7️⃣ Prepare compliance document
+        compliance_doc = {
+            "company": request.company,
+            "file_path": expense.get("fileUrl"),
+            "source": "manual_expense",
+            "expense_id": request.expense_id,
+            "violations": report["violations"],
+            "classification": {
+                "compliant_items": 1 if report["is_compliant"] else 0,
+                "non_compliant_items": 0 if report["is_compliant"] else 1,
+                "total_items": 1,
+                "compliance_score": report["compliance_score"],
+            },
+            "categories_checked": stored_categories,
+            "bill_id": bill_facts.get("bill_id"),
+            "policy_name": request.policy_name,
+            "metadata": {
+                "bill_category": report["category_info"]["bill_category"],
+                "matched_category": report["category_info"]["matched_category"],
+                "similarity": report["category_info"]["similarity"],
+                "source_type": "manual_expense",
                 "expense_title": expense.get("title"),
-                "expense_date": expense_date,
+                "expense_date": expense.get("date"),
                 "currency": expense.get("currency"),
                 "original_amount": expense.get("originalAmount"),
-                "total_amount": expense.get("totalAmount"),
                 "item_count": len(expense.get("items", [])),
-                "policy_name": request.policy_name,
-                "overall_score": report["compliance_score"],
-                "is_compliant": report["is_compliant"],
-                "category_info": report["category_info"],
-                "mismatch_count": report["total_violations"],
-                "severity_breakdown": report["severity_breakdown"],
-                "mismatches": report["violations"],
-                "summary": report["summary"],
-            }
-        )
+            },
+            "total_violations": report["total_violations"],
+            "violations_by_severity": report["severity_breakdown"],
+            "created_at": datetime.utcnow(),
+        }
+
+        db_client.store_compliance_check(make_json_safe(compliance_doc))
+        logger.info(f"✅ Compliance check completed. Score: {report['compliance_score']}")
+
+        # 8️⃣ Build response (same format)
+        response = {
+            "company": request.company,
+            "expense_id": request.expense_id,
+            "bill_id": bill_facts.get("bill_id"),
+            "source": "manual_expense",
+            "expense_title": expense.get("title"),
+            "expense_date": expense.get("date"),
+            "currency": expense.get("currency"),
+            "original_amount": expense.get("originalAmount"),
+            "total_amount": expense.get("totalAmount"),
+            "item_count": len(expense.get("items", [])),
+            "policy_name": request.policy_name,
+            "overall_score": report["compliance_score"],
+            "is_compliant": report["is_compliant"],
+            "category_info": report["category_info"],
+            "mismatch_count": report["total_violations"],
+            "severity_breakdown": report["severity_breakdown"],
+            "mismatches": report["violations"],
+            "summary": report["summary"],
+        }
+
+        return JSONResponse(make_json_safe(response))
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error checking bill from expense: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
 
 @app.post("/api/bill/check/url")
 async def check_bill_from_url(request: BillCheckURLRequest):
