@@ -535,7 +535,7 @@ async def check_bill_from_expense(request: BillCheckExpenseRequest):
     try:
         logger.info(
             f"⚡ Checking bill from expense ID for {request.company}, "
-            f"expense_id={request.expense_id}, policy_name={request.policy_name or 'ALL'}"
+            f"expense_id={request.expense_id}, policy_name={request.policy_name or ''}"
         )
 
         # 1️⃣ Check if compliance already exists
