@@ -1,5 +1,6 @@
 # main_url_optimized.py - FastAPI Backend with URL Support for Bills
-# ✅ FIXED: Expense JSON → Bill Facts Conversion (Direct mapping, no text parsing)
+# ✅ UPDATED: Status-based policy management (removed effective_from/effective_to)
+# ✅ UPDATED: Dynamic database switching for both MongoDBClient and RAGEngine
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +11,7 @@ import tempfile
 import os
 import time
 import gc
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import sys
 from dotenv import load_dotenv
@@ -44,7 +45,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Policy Compliance Checker API - URL Support",
     description="RAG-powered compliance verification with Google Drive & S3 support",
-    version="1.2.0",
+    version="1.3.0",
     docs_url="/docs" if ENVIRONMENT == "development" else None,
     redoc_url="/redoc" if ENVIRONMENT == "development" else None,
 )
@@ -81,6 +82,40 @@ async def log_requests(request: Request, call_next):
     gc.collect()
     return response
 
+# 🆕 ENHANCED: Origin-based DB switching middleware for both MongoDBClient and RAGEngine
+@app.middleware("http")
+async def capture_origin_and_switch_db(request: Request, call_next):
+    """
+    🆕 ENHANCED: Capture the frontend origin from request headers and switch DB for both MongoDBClient and RAGEngine.
+    This runs before every request to ensure both services use the correct database.
+    """
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+    client_ip = request.client.host if request.client else None
+
+    # Switch MongoDBClient database
+    if db_client:
+        # Store request metadata
+        db_client.origin = origin
+        db_client.referer = referer
+        db_client.client_ip = client_ip
+
+        # 🔄 Dynamically switch database based on origin
+        db_client.switch_db_based_on_origin(origin)
+    
+    # 🆕 NEW: Switch RAGEngine database
+    if rag_engine and origin:
+        rag_engine.switch_database(origin)
+        
+    logger.info(
+        f"🌍 Request from origin={origin}, referer={referer}, "
+        f"ip={client_ip}, path={request.url.path}, "
+        f"DB switched for both MongoDBClient and RAGEngine"
+    )
+
+    response = await call_next(request)
+    return response
+
 # Initialize services
 pdf_extractor = None
 policy_parser = None
@@ -101,7 +136,10 @@ async def startup_event():
         pdf_extractor = EnhancedPDFExtractor()  # Enhanced with URL support
         policy_parser = PolicyParser()
         bill_parser = BillParser()
-        rag_engine = RAGEngine()
+        
+        # ✅ Initialize RAGEngine without origin first (will switch dynamically in middleware)
+        rag_engine = RAGEngine(origin=None)
+        
         compliance_checker = ComplianceChecker()
         db_client = MongoDBClient()
 
@@ -111,6 +149,7 @@ async def startup_event():
 
         logger.info("✅ URL-ENABLED application started successfully")
         logger.info("📁 Supported sources: File Upload, Google Drive, AWS S3, Direct URLs")
+        logger.info("🔄 Dynamic database switching: ENABLED for both MongoDBClient and RAGEngine")
     except Exception as e:
         logger.error(f"Error during startup: {e}")
         raise
@@ -338,7 +377,7 @@ def convert_expense_to_bill_facts(expense: Dict[str, Any]) -> Dict[str, Any]:
         "raw_text": build_readable_summary(expense),
         
         # Processing metadata
-        "parsed_at": datetime.utcnow().isoformat(),
+        "parsed_at": datetime.now(timezone.utc).isoformat(),
         "confidence": 0.95,  # High confidence since data is already structured
         "parsing_method": "direct_json_conversion",  # Track method
     }
@@ -348,7 +387,8 @@ def convert_expense_to_bill_facts(expense: Dict[str, Any]) -> Dict[str, Any]:
         f"id={bill_facts['bill_id']}, "
         f"category={primary_category}, "
         f"amount={total_amount}, "
-        f"items={len(items)}"
+        f"items={len(items)}",
+        
     )
     
     return bill_facts
@@ -371,12 +411,28 @@ async def validate_file_size(file: UploadFile) -> int:
         )
     return file_size
 
+def make_json_safe(doc):
+    """
+    Recursively convert ObjectId and datetime values in a MongoDB document
+    into JSON-serializable strings.
+    """
+    if isinstance(doc, list):
+        return [make_json_safe(i) for i in doc]
+    elif isinstance(doc, dict):
+        return {k: make_json_safe(v) for k, v in doc.items()}
+    elif isinstance(doc, ObjectId):
+        return str(doc)
+    elif isinstance(doc, datetime):
+        return doc.isoformat()
+    else:
+        return doc
+
 # Routes
 @app.get("/")
 async def root():
     return {
         "message": "Policy Compliance Checker API - URL Support",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "status": "running",
         "environment": ENVIRONMENT,
         "features": [
@@ -385,7 +441,9 @@ async def root():
             "AWS S3 URLs",
             "Direct HTTP/HTTPS URLs",
             "Batch LLM processing (80% faster)",
-            "✅ Direct JSON expense conversion (NEW)"
+            "✅ Direct JSON expense conversion",
+            "✅ Status-based policy management (NEW)",
+            "🔄 Dynamic multi-database support (NEW)"
         ]
     }
 
@@ -411,8 +469,9 @@ async def health_check():
         "environment": ENVIRONMENT,
         "database": db_status,
         "pdf_sources": pdf_capabilities,
-        "timestamp": datetime.utcnow().isoformat(),
-        "optimized": True
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "optimized": True,
+        "dynamic_db": True
     }
 
 @app.post("/api/policy/upload")
@@ -420,17 +479,27 @@ async def upload_policy(
     file: UploadFile = File(...),
     company: str = Form(...),
     policy_name: str = Form(...),
-    effective_from: Optional[str] = Form(None),
-    effective_to: Optional[str] = Form(None),
+    status: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
 ):
-    """Upload and process policy (same as before)"""
+    """
+    Upload and process policy.
+    ✅ UPDATED: Uses status field (active/inactive), defaults to 'inactive' if not provided
+    """
     try:
         logger.info(f"⚡ Processing policy upload for company: {company}")
 
-        # ✅ Default effective_from to today's date if not provided
-        if not effective_from:
-            effective_from = datetime.utcnow().strftime("%Y-%m-%d")
+        # ✅ Default status to 'inactive' if not provided
+        if not status:
+            status = "inactive"
+            logger.info("Status not provided, defaulting to 'inactive'")
+
+        # Validate status value
+        if status not in ["active", "inactive"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Status must be either 'active' or 'inactive'"
+            )
 
         file_size = await validate_file_size(file)
         logger.info(f"File size: {file_size/1024:.2f}KB")
@@ -468,8 +537,7 @@ async def upload_policy(
                 "policy_name": policy_name,
                 "description": description or "",
                 "rules_extracted": rules,
-                "effective_from": effective_from,
-                "effective_to": effective_to,
+                "status": status,  # ✅ UPDATED: Store status instead of dates
                 "categories": categories,
                 "embeddings_model": "models/text-embedding-004",
                 "total_rules": len(rules),
@@ -482,7 +550,7 @@ async def upload_policy(
                     status_code=500, detail="Failed to store policy in database"
                 )
 
-            logger.info(f"✅ Successfully stored policy with {len(rules)} rules for {company}")
+            logger.info(f"✅ Successfully stored policy with {len(rules)} rules for {company} (status: {status})")
 
             return JSONResponse(
                 {
@@ -490,12 +558,11 @@ async def upload_policy(
                     "company": company,
                     "policy_name": policy_name,
                     "description": description,
+                    "policy_status": status,  # ✅ UPDATED: Return status
                     "rules_count": len(rules),
                     "rules_extracted": rules,
                     "categories": categories,
-                    "effective_from": effective_from,
-                    "effective_to": effective_to,
-                    "message": "Policy uploaded and indexed successfully",
+                    "message": f"Policy uploaded and indexed successfully with status '{status}'",
                 }
             )
 
@@ -508,22 +575,6 @@ async def upload_policy(
     except Exception as e:
         logger.error(f"Error processing policy: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-def make_json_safe(doc):
-    """
-    Recursively convert ObjectId and datetime values in a MongoDB document
-    into JSON-serializable strings.
-    """
-    if isinstance(doc, list):
-        return [make_json_safe(i) for i in doc]
-    elif isinstance(doc, dict):
-        return {k: make_json_safe(v) for k, v in doc.items()}
-    elif isinstance(doc, ObjectId):
-        return str(doc)
-    elif isinstance(doc, datetime):
-        return doc.isoformat()
-    else:
-        return doc
 
 
 @app.post("/api/bill/check/expense")
@@ -606,6 +657,7 @@ async def check_bill_from_expense(request: BillCheckExpenseRequest):
             policy_name=request.policy_name,
         )
 
+        logger.info("✅ Compliance check completed",compliance_result)
         # 6️⃣ Generate report
         report = compliance_checker.generate_detailed_report(compliance_result)
 
@@ -627,8 +679,8 @@ async def check_bill_from_expense(request: BillCheckExpenseRequest):
             "policy_name": request.policy_name,
             "metadata": {
                 "bill_category": report["category_info"]["bill_category"],
-                "matched_category": report["category_info"]["matched_category"],
-                "similarity": report["category_info"]["similarity"],
+                "matched_category": report.get("category_info", {}).get("matched_category", "Unknown"),
+                "similarity": report.get("category_info", {}).get("similarity", "Unknown"),
                 "source_type": "manual_expense",
                 "expense_title": expense.get("title"),
                 "expense_date": expense.get("date"),
@@ -638,7 +690,7 @@ async def check_bill_from_expense(request: BillCheckExpenseRequest):
             },
             "total_violations": report["total_violations"],
             "violations_by_severity": report["severity_breakdown"],
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(timezone.utc),
         }
 
         db_client.store_compliance_check(make_json_safe(compliance_doc))
@@ -974,11 +1026,11 @@ async def delete_policy(company: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
 @app.get("/api/policies/{company}")
 async def list_company_policies(company: str):
     """
-    Get all policies for a company (name, description, status, effective dates, etc.)
+    Get all policies for a company (name, description, status, etc.)
+    ✅ UPDATED: Returns status field instead of effective dates
     """
     try:
         policies = db_client.get_policies_by_company(company)
@@ -990,53 +1042,20 @@ async def list_company_policies(company: str):
                     "total_policies": 0,
                     "policies": []
                 }
-                        
             )
 
         # Return summarized metadata, not full rules
         response = []
-        current_date = datetime.now().date()
         
         for p in policies:
-            # Dynamically determine status based on dates
-            effective_from = p.get("effective_from")
-            effective_to = p.get("effective_to")
-            
-            status = "active"  # default
-            
-            if effective_from and effective_to:
-                try:
-                    # Parse dates if they're strings
-                    if isinstance(effective_from, str):
-                        effective_from = datetime.fromisoformat(effective_from.replace('Z', '+00:00')).date()
-                    elif isinstance(effective_from, datetime):
-                        effective_from = effective_from.date()
-                    
-                    if isinstance(effective_to, str):
-                        effective_to = datetime.fromisoformat(effective_to.replace('Z', '+00:00')).date()
-                    elif isinstance(effective_to, datetime):
-                        effective_to = effective_to.date()
-                    
-                    # Determine status
-                    if current_date < effective_from:
-                        status = "inactive"  # or "pending" if you prefer
-                    elif current_date > effective_to:
-                        status = "inactive"  # or "expired"
-                    else:
-                        status = "active"
-                except Exception as date_parse_error:
-                    logger.warning(f"Error parsing dates for policy {p.get('policy_name')}: {date_parse_error}")
-                    status = p.get("status", "active")  # fallback to stored status
-            else:
-                status = p.get("status", "active")  # fallback if dates not present
+            # ✅ UPDATED: Use status directly from DB
+            status = p.get("status", "inactive")  # Default to inactive if not set
             
             response.append(
                 {
                     "policy_name": p.get("policy_name"),
                     "description": p.get("description", ""),
-                    "status": status,
-                    "effective_from": p.get("effective_from"),
-                    "effective_to": p.get("effective_to"),
+                    "status": status,  # ✅ UPDATED: Direct status field
                     "total_rules": p.get("total_rules", 0),
                     "categories": p.get("categories", []),
                     "last_updated": p.get(
@@ -1063,7 +1082,10 @@ async def list_company_policies(company: str):
     
 @app.get("/api/policy/{company}/{policy_name}")
 async def get_policy_by_name(company: str, policy_name: str):
-    """Get a specific policy for a company"""
+    """
+    Get a specific policy for a company
+    ✅ UPDATED: Returns status field instead of effective dates
+    """
     try:
         policy = db_client.get_policy_by_name(company, policy_name)
         if not policy:
@@ -1072,46 +1094,14 @@ async def get_policy_by_name(company: str, policy_name: str):
                 detail=f"Policy '{policy_name}' not found for company '{company}'"
             )
 
-        # Dynamically determine status based on dates
-        current_date = datetime.now().date()
-        effective_from = policy.get("effective_from")
-        effective_to = policy.get("effective_to")
-        
-        status = "active"  # default
-        
-        if effective_from and effective_to:
-            try:
-                # Parse dates if they're strings
-                if isinstance(effective_from, str):
-                    effective_from = datetime.fromisoformat(effective_from.replace('Z', '+00:00')).date()
-                elif isinstance(effective_from, datetime):
-                    effective_from = effective_from.date()
-                
-                if isinstance(effective_to, str):
-                    effective_to = datetime.fromisoformat(effective_to.replace('Z', '+00:00')).date()
-                elif isinstance(effective_to, datetime):
-                    effective_to = effective_to.date()
-                
-                # Determine status
-                if current_date < effective_from:
-                    status = "inactive"  # or "pending"
-                elif current_date > effective_to:
-                    status = "inactive"  # or "expired"
-                else:
-                    status = "active"
-            except Exception as date_parse_error:
-                logger.warning(f"Error parsing dates for policy {policy_name}: {date_parse_error}")
-                status = policy.get("status", "active")  # fallback to stored status
-        else:
-            status = policy.get("status", "active")  # fallback if dates not present
+        # ✅ UPDATED: Use status directly from DB
+        status = policy.get("status", "inactive")  # Default to inactive if not set
 
         return JSONResponse({
             "company": company,
             "policy_name": policy.get("policy_name"),
             "description": policy.get("description", ""),
-            "status": status,
-            "effective_from": policy.get("effective_from"),
-            "effective_to": policy.get("effective_to"),
+            "status": status,  # ✅ UPDATED: Direct status field
             "total_rules": policy.get("total_rules", 0),
             "categories": policy.get("categories", []),
             "rules_extracted": policy.get("rules_extracted", []),
@@ -1131,13 +1121,12 @@ async def update_policy(
     policy_name: str,
     file: Optional[UploadFile] = File(None),
     description: Optional[str] = Form(None),
-    effective_from: Optional[str] = Form(None),
-    effective_to: Optional[str] = Form(None),
     status: Optional[str] = Form(None),
 ):
     """
     Update an existing policy:
-    - If JSON fields are given (description, effective dates, status): only update those.
+    ✅ UPDATED: Uses status field (active/inactive) instead of effective dates
+    - If JSON fields are given (description, status): only update those.
     - If file is provided: re-extract rules, categories, and embeddings (like upload),
       and replace those fields in DB.
     Returns full updated policy document.
@@ -1155,11 +1144,14 @@ async def update_policy(
         updated_fields = {}
         if description is not None:
             updated_fields["description"] = description
-        if effective_from is not None:
-            updated_fields["effective_from"] = effective_from
-        if effective_to is not None:
-            updated_fields["effective_to"] = effective_to
+        
+        # ✅ UPDATED: Handle status field with validation
         if status is not None:
+            if status not in ["active", "inactive"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Status must be either 'active' or 'inactive'"
+                )
             updated_fields["status"] = status
 
         # 🔄 File reprocessing
@@ -1200,7 +1192,7 @@ async def update_policy(
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
 
-        updated_fields["updated_at"] = datetime.utcnow().isoformat()
+        updated_fields["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         success = db_client.update_policy(company, policy_name, updated_fields)
         if not success:
@@ -1208,44 +1200,15 @@ async def update_policy(
 
         updated_policy = db_client.get_policy_by_name(company, policy_name)
 
-        # 🧠 Compute status dynamically (same as get_policy_by_name)
-        current_date = datetime.now().date()
-        effective_from = updated_policy.get("effective_from")
-        effective_to = updated_policy.get("effective_to")
-
-        computed_status = "active"
-        try:
-            if effective_from and effective_to:
-                if isinstance(effective_from, str):
-                    effective_from = datetime.fromisoformat(effective_from.replace('Z', '+00:00')).date()
-                elif isinstance(effective_from, datetime):
-                    effective_from = effective_from.date()
-
-                if isinstance(effective_to, str):
-                    effective_to = datetime.fromisoformat(effective_to.replace('Z', '+00:00')).date()
-                elif isinstance(effective_to, datetime):
-                    effective_to = effective_to.date()
-
-                if current_date < effective_from:
-                    computed_status = "inactive"
-                elif current_date > effective_to:
-                    computed_status = "inactive"
-                else:
-                    computed_status = "active"
-            else:
-                computed_status = updated_policy.get("status", "active")
-        except Exception as e:
-            logger.warning(f"Error parsing dates while computing status for {policy_name}: {e}")
-            computed_status = updated_policy.get("status", "active")
+        # ✅ UPDATED: Use status directly from DB
+        final_status = updated_policy.get("status", "inactive")
 
         # ✅ Return in SAME format as get_policy_by_name
         return JSONResponse({
             "company": company,
             "policy_name": updated_policy.get("policy_name"),
             "description": updated_policy.get("description", ""),
-            "status": computed_status,
-            "effective_from": updated_policy.get("effective_from"),
-            "effective_to": updated_policy.get("effective_to"),
+            "status": final_status,  # ✅ UPDATED: Direct status field
             "total_rules": updated_policy.get("total_rules", 0),
             "categories": updated_policy.get("categories", []),
             "rules_extracted": updated_policy.get("rules_extracted", []),
@@ -1259,13 +1222,62 @@ async def update_policy(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.get("/api/policy/{company}/{policy_name}/rules/list")
+async def get_policy_rules_list(company: str, policy_name: str):
+    """
+    🧾 Get only the text list of rules for a specific policy in a company.
+    Returns an array of rule strings instead of full rule objects.
+    """
+    try:
+        logger.info(f"Fetching rule list for policy '{policy_name}' of company '{company}'")
+
+        policy = db_client.get_policy_by_name(company, policy_name)
+        if not policy:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Policy '{policy_name}' not found for company '{company}'"
+            )
+
+        rules_data = policy.get("rules_extracted", [])
+        if not rules_data:
+            return JSONResponse(
+                {
+                    "company": company,
+                    "policy_name": policy_name,
+                    "total_rules": 0,
+                    "rules": []
+                }
+            )
+
+        # Extract only rule texts
+        rule_texts = [
+            rule.get("raw_text") or rule.get("rule_text") or str(rule)
+            for rule in rules_data
+        ]
+
+        return JSONResponse(
+            {
+                "company": company,
+                "policy_name": policy_name,
+                "total_rules": len(rule_texts),
+                "rules": rule_texts,
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching rule list for policy '{policy_name}' of company '{company}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
 # ----------------------------
 # Entry Point
 # ----------------------------
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("🚀 Starting URL-ENABLED FastAPI application")
+    logger.info("🚀 Starting URL-ENABLED FastAPI application with STATUS-BASED policy management")
     uvicorn.run(
         app, host="0.0.0.0", port=PORT, log_level=log_level.lower(), access_log=True
     )

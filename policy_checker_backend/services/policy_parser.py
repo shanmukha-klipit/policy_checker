@@ -1,36 +1,37 @@
-# services/optimized_policy_parser_fixed.py - Properly optimized with maintained quality
+# services/improved_policy_parser.py - Enhanced with better rule categorization
 
 import google.generativeai as genai
 import os
 import json
 import logging
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import re
+import hashlib
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 class PolicyParser:
     """
-    ✅ PROPERLY OPTIMIZED Policy parser:
-    - Maintains comprehensive extraction (22+ rules)
-    - Improved prompt with explicit instructions
-    - Better retry logic based on content analysis
-    - Enhanced fallback mechanisms
+    Improved Policy Parser with:
+    - Better rule categorization and attributes extraction
+    - Proper rule deduplication
+    - Consistent extraction
+    - Better validation
     """
     
     STANDARD_CATEGORIES = {
-        "Travel": ["travel", "journey", "trip", "transport", "commute", "fare", "ticket"],
+        "Travel": ["travel", "journey", "trip", "transport", "commute", "fare", "ticket", "flight", "train", "cab", "bus", "uber", "ola"],
         "Accommodation": ["hotel", "accommodation", "lodging", "stay", "room", "boarding"],
-        "Food": ["food", "meal", "lunch", "dinner", "breakfast", "refreshment", "beverage", "catering"],
+        "Food": ["food", "meal", "lunch", "dinner", "breakfast", "refreshment", "beverage", "catering", "coffee", "tea"],
         "Communication": ["phone", "mobile", "internet", "data", "call", "telecom", "communication"],
         "Medical": ["medical", "health", "medicine", "doctor", "hospital", "clinic", "treatment"],
         "Entertainment": ["entertainment", "client", "guest", "hospitality", "recreation"],
-        "Supplies": ["supplies", "stationery", "equipment", "materials", "office"],
+        "Supplies": ["supplies", "stationery", "equipment", "materials", "office", "software", "tools"],
         "Training": ["training", "course", "education", "workshop", "seminar", "conference"],
-        "Other": []
+        "Other": ["other", "miscellaneous", "general"]
     }
     
     def __init__(self):
@@ -40,173 +41,144 @@ class PolicyParser:
         
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.0-flash')
-        logger.info("✅ Properly Optimized Policy Parser initialized")
+        logger.info("✅ Improved Policy Parser initialized")
+    
+    def _generate_rule_hash(self, rule_text: str, category: str, attributes: Dict[str, Any]) -> str:
+        """Generate a unique hash for a rule to detect duplicates"""
+        normalized_text = ' '.join(rule_text.lower().split())
+        
+        key_attrs = {
+            'max_amount': attributes.get('max_amount'),
+            'min_amount': attributes.get('min_amount'),
+            'allowed_modes': sorted(attributes.get('allowed_modes', [])),
+            'disallowed_modes': sorted(attributes.get('disallowed_modes', [])),
+            'conditions': sorted(attributes.get('conditions', []))
+        }
+        
+        hash_input = f"{normalized_text}|{category}|{json.dumps(key_attrs, sort_keys=True)}"
+        return hashlib.md5(hash_input.encode()).hexdigest()
+    
+    def _deduplicate_rules(self, rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Deduplicate rules based on content similarity."""
+        seen_hashes = {}
+        unique_rules = []
+        
+        for rule in rules:
+            rule_hash = self._generate_rule_hash(
+                rule.get('raw_text', ''),
+                rule.get('category', ''),
+                rule.get('attributes', {})
+            )
+            
+            if rule_hash not in seen_hashes:
+                seen_hashes[rule_hash] = rule
+                unique_rules.append(rule)
+            else:
+                existing = seen_hashes[rule_hash]
+                existing_attrs = len([v for v in existing.get('attributes', {}).values() if v])
+                new_attrs = len([v for v in rule.get('attributes', {}).values() if v])
+                
+                if new_attrs > existing_attrs:
+                    unique_rules.remove(existing)
+                    unique_rules.append(rule)
+                    seen_hashes[rule_hash] = rule
+                    logger.info(f"Replaced duplicate rule: {rule.get('rule_id')}")
+        
+        logger.info(f"Deduplication: {len(rules)} → {len(unique_rules)} rules")
+        return unique_rules
     
     def parse_policy(self, policy_text: str, company: str) -> Dict[str, Any]:
-        """
-        Enhanced parsing with maintained quality:
-        - Comprehensive prompt (based on old working version)
-        - Smart retry logic
-        - Better JSON extraction
-        """
+        """Enhanced parsing with better rule extraction"""
         
-        # MAIN PROMPT - Based on your original working version but slightly optimized
-        main_prompt = f"""You are an expert policy analyzer. Extract ALL compliance rules from this company policy document.
+        main_prompt = f"""You are an expert HR policy analyzer. Extract detailed compliance rules from this policy document.
 
 CRITICAL INSTRUCTIONS:
-1. Extract EVERY single rule, limit, condition, and restriction - be EXHAUSTIVE
-2. If one sentence contains multiple rules, create separate entries for each
-3. If a rule applies to multiple categories, duplicate it under each category
-4. Assign each rule to ONE primary category from: {list(self.STANDARD_CATEGORIES.keys())}
-5. Extract ALL attributes comprehensively - don't leave nulls if info exists
+1. Extract EVERY distinct rule as a SEPARATE item
+2. Differentiate between POSITIVE rules (what's allowed/required) and NEGATIVE rules (what's prohibited)
+3. Each rule = ONE specific constraint or requirement
+4. Assign each rule to appropriate category
+5. Extract ALL attributes mentioned in the policy
 
-CATEGORY DEFINITIONS (choose the BEST fit):
-- Travel: Transportation, fares, tickets, commute, journey, cab, bus, train, flight
-- Accommodation: Hotels, lodging, stays, rooms, boarding, guest house
-- Food: Meals, refreshments, beverages, catering, lunch, dinner, breakfast, snacks
-- Communication: Phone, mobile, internet, data, calls, telecom, broadband
-- Medical: Healthcare, medicine, treatment, doctor, hospital, clinic, insurance
-- Entertainment: Client entertainment, hospitality, recreation, events
-- Supplies: Office supplies, equipment, materials, stationery
-- Training: Courses, workshops, conferences, seminars, education, learning
-- Other: Anything that doesn't clearly fit above categories
+STANDARD CATEGORIES:
+Travel, Accommodation, Food, Communication, Medical, Entertainment, Supplies, Training, Other
 
-RULE STRUCTURE - Each rule MUST have:
+RULE STRUCTURE:
 {{
-  "rule_id": "unique_id (r1, r2, r3...)",
-  "category": "ONE of the standard categories",
-  "subcategory": "specific type (e.g., 'domestic_flight', 'hotel_booking', '3star_hotel')",
+  "rule_id": "unique_id",
+  "category": "one of the standard categories",
+  "rule_type": "positive" (what's allowed/required) or "negative" (what's prohibited),
+  "raw_text": "exact rule text from policy",
   "attributes": {{
-    "max_amount": numeric_value or null,
-    "min_amount": numeric_value or null,
-    "currency": "INR|USD|EUR" (default INR),
-    "scope": "per_trip|per_day|per_month|per_year|total|per_person|per_night",
-    "allowed_modes": ["list", "of", "allowed", "options"] or null,
-    "disallowed_modes": ["list", "of", "disallowed", "items"] or null,
-    "conditions": ["prior_approval", "receipt_required", "manager_approval", "HR_approval", etc.],
-    "domestic_only": true|false|null,
-    "international_only": true|false|null,
-    "grade_restrictions": ["grade_levels"] or null,
-    "time_restrictions": "description" or null,
-    "quantity_limits": "description" or null,
-    "vendor_restrictions": ["approved_vendors"] or null,
-    "any_other_restriction": "capture ANY other limitation mentioned"
+    "max_amount": number or null,
+    "min_amount": number or null,
+    "currency": "INR|USD|EUR" (only if amount specified),
+    "time_limit_days": number or null (e.g., "within 10 days" → 10),
+    "receipt_required": true|false|null,
+    "approval_required": true|false|null,
+    "conditions": ["list", "of", "conditions"],
+    "allowed_items": ["list"] or null,
+    "disallowed_items": ["list"] or null,
+    "notes": "any other important details"
   }},
-  "raw_text": "exact original policy text from document",
-  "severity": "HIGH|MEDIUM|LOW",
-  "applies_to": "all_employees|specific_grades|specific_departments|etc"
+  "severity": "HIGH" (mandatory/absolute rules) or "MEDIUM" (recommended/conditional),
+  "applies_to": "all_employees"
 }}
 
-EXAMPLES:
-Policy: "Employees traveling domestically can book economy flights up to INR 15,000. Business class requires VP approval."
-Rules:
-[
-  {{
-    "rule_id": "r1",
-    "category": "Travel",
-    "subcategory": "domestic_flight",
-    "attributes": {{
-      "max_amount": 15000,
-      "currency": "INR",
-      "scope": "per_trip",
-      "allowed_modes": ["economy"],
-      "conditions": [],
-      "domestic_only": true
-    }},
-    "raw_text": "Employees traveling domestically can book economy flights up to INR 15,000.",
-    "severity": "HIGH"
-  }},
-  {{
-    "rule_id": "r2",
-    "category": "Travel",
-    "subcategory": "domestic_flight_business_class",
-    "attributes": {{
-      "allowed_modes": ["business_class"],
-      "conditions": ["VP_approval"],
-      "domestic_only": true
-    }},
-    "raw_text": "Business class requires VP approval.",
-    "severity": "HIGH"
-  }}
-]
+IMPORTANT RULES FOR THIS POLICY:
+- "Receipts mandatory above ₹300" = Create ONE rule about receipt requirement with min_amount: 300
+- "Submit within 10 working days" = Create ONE rule about time_limit_days: 10
+- "All reimbursements in INR" = Create ONE rule about currency: "INR"
+- "Pre-approval required" = Create ONE rule about approval_required: true
+- "Personal purchases not reimbursable" = Create ONE rule with rule_type: "negative"
+- "Daily limits may apply" = Create ONE rule noting limits apply (no specific amount)
 
-Policy: "Hotel stays limited to 3-star properties, max INR 5,000/night. Alcohol not reimbursable."
-Rules:
-[
-  {{
-    "rule_id": "r3",
-    "category": "Accommodation",
-    "subcategory": "hotel_3star",
-    "attributes": {{
-      "max_amount": 5000,
-      "currency": "INR",
-      "scope": "per_night",
-      "quantity_limits": "3-star properties only",
-      "conditions": ["receipt_required"]
-    }},
-    "raw_text": "Hotel stays limited to 3-star properties, max INR 5,000/night.",
-    "severity": "HIGH"
-  }},
-  {{
-    "rule_id": "r4",
-    "category": "Food",
-    "subcategory": "beverages",
-    "attributes": {{
-      "disallowed_modes": ["alcohol", "alcoholic_beverages"],
-      "any_other_restriction": "no reimbursement for alcohol"
-    }},
-    "raw_text": "Alcohol not reimbursable.",
-    "severity": "HIGH"
-  }}
-]
-
-POLICY DOCUMENT TO ANALYZE:
+POLICY DOCUMENT:
 {policy_text}
 
-RETURN FORMAT - Valid JSON only:
+Return ONLY valid JSON in format:
 {{
-  "categories_found": ["list", "of", "all", "categories"],
-  "rules": [array of rule objects following structure above]
+  "categories_found": ["list of categories"],
+  "rules": [array of rule objects with all details]
 }}
 
-REMEMBER: Be EXHAUSTIVE. Extract EVERY rule, even minor ones. Don't summarize - create individual entries.
+IMPORTANT: 
+- Extract each distinct rule separately
+- Include both positive (allowed) and negative (prohibited) rules
+- Be precise with amounts and time limits
+- Keep raw_text as exact quote from policy
 """
 
         def extract_json_robust(text: str) -> str:
-            """More robust JSON extraction"""
+            """Robust JSON extraction"""
             text = text.strip()
             
-            # Try markdown code blocks first
             if '```json' in text:
                 parts = text.split('```json', 1)
                 if len(parts) > 1:
-                    json_part = parts[1].split('```', 1)[0].strip()
-                    return json_part
+                    return parts[1].split('```', 1)[0].strip()
             
             if '```' in text:
                 parts = text.split('```', 1)
                 if len(parts) > 1:
-                    json_part = parts[1].split('```', 1)[0].strip()
-                    return json_part
+                    return parts[1].split('```', 1)[0].strip()
             
-            # Find first { to last }
             first_brace = text.find('{')
             last_brace = text.rfind('}')
             
-            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            if first_brace != -1 and last_brace != -1:
                 return text[first_brace:last_brace + 1]
             
             return text
         
         try:
-            # Primary extraction attempt
-            logger.info("🔍 Starting comprehensive rule extraction...")
+            logger.info("🔍 Starting rule extraction...")
+            
             response = self.model.generate_content(
                 main_prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,  # Low temp for consistency
-                    top_p=0.95,
-                    max_output_tokens=16384,  # Increased for comprehensive extraction
+                    temperature=0.0,
+                    top_p=0.9,
+                    max_output_tokens=16384,
                 )
             )
             
@@ -215,82 +187,58 @@ REMEMBER: Be EXHAUSTIVE. Extract EVERY rule, even minor ones. Don't summarize - 
             parsed_data = json.loads(json_text)
             
             rules = parsed_data.get('rules', [])
-            initial_count = len(rules)
-            logger.info(f"📊 Initial extraction: {initial_count} rules")
+            logger.info(f"📊 Initial extraction: {len(rules)} rules")
             
-            # Smart retry logic based on policy length
-            policy_word_count = len(policy_text.split())
-            expected_min_rules = max(15, policy_word_count // 100)  # Dynamic threshold
+            # Deduplicate
+            rules = self._deduplicate_rules(rules)
+            logger.info(f"📊 After deduplication: {len(rules)} unique rules")
             
-            if initial_count < expected_min_rules:
-                logger.warning(f"⚠️ Only {initial_count} rules found, expected ~{expected_min_rules}. Retrying with emphasis...")
-                
-                retry_prompt = main_prompt + f"""
-
-⚠️ IMPORTANT: The previous extraction only found {initial_count} rules, but this policy document has {policy_word_count} words and likely contains MORE rules.
-
-PLEASE RE-ANALYZE and extract:
-- Every numeric limit (amounts, quantities, time periods)
-- Every approval requirement
-- Every restriction or prohibition
-- Every condition or qualification
-- Every allowed/disallowed item or mode
-- Every grade-specific rule
-- Every subcategory variation
-
-Be MORE GRANULAR. If a sentence mentions multiple limits or conditions, create SEPARATE rules for each.
-"""
-                
-                response2 = self.model.generate_content(
-                    retry_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.05,  # Even lower temp
-                        top_p=0.9,
-                        max_output_tokens=16384,
-                    )
-                )
-                
-                json_text2 = extract_json_robust(response2.text.strip())
-                parsed_data2 = json.loads(json_text2)
-                
-                rules2 = parsed_data2.get('rules', [])
-                logger.info(f"📊 Retry extraction: {len(rules2)} rules")
-                
-                # Use whichever result has more rules
-                if len(rules2) > initial_count:
-                    parsed_data = parsed_data2
-                    logger.info(f"✅ Using retry result ({len(rules2)} rules)")
-            
-            # Validate and enrich (same as original)
+            # Validate and enrich
             validated_rules = []
             categories_set = set()
             
-            rules = parsed_data.get('rules', [])
             for idx, rule in enumerate(rules):
-                # Ensure required fields
                 if not rule.get('rule_id'):
                     rule['rule_id'] = f"r{idx+1}"
+                else:
+                    rule['rule_id'] = f"r{idx+1}"
                 
-                # Normalize category
                 category = rule.get('category', 'Other')
                 normalized_category = self._normalize_category(category)
                 rule['category'] = normalized_category
                 categories_set.add(normalized_category)
                 
-                # Ensure attributes exist
                 if not rule.get('attributes'):
                     rule['attributes'] = {}
                 
-                # Set defaults
+                attrs = rule['attributes']
+                rule_text_lower = rule.get('raw_text', '').lower()
+                
+                # Only keep currency if amount is specified or currency is mentioned
+                if attrs.get('currency'):
+                    has_amount = attrs.get('max_amount') or attrs.get('min_amount')
+                    mentions_currency = any(keyword in rule_text_lower for keyword in [
+                        'currency', 'inr', 'usd', 'eur', 'aed', 'gbp', '₹', 'rs.', 
+                        'processed in', 'reimbursed in', 'paid in'
+                    ])
+                    
+                    if not (has_amount or mentions_currency):
+                        attrs.pop('currency', None)
+                
+                if attrs.get('currency'):
+                    attrs['currency'] = attrs['currency'].upper()
+                
                 if not rule.get('severity'):
                     rule['severity'] = self._infer_severity(rule)
                 
                 if not rule.get('applies_to'):
                     rule['applies_to'] = 'all_employees'
                 
-                # Add metadata
+                if not rule.get('rule_type'):
+                    rule['rule_type'] = 'positive'
+                
                 rule['company'] = company
-                rule['extracted_at'] = datetime.utcnow().isoformat()
+                rule['extracted_at'] = datetime.now(timezone.utc).isoformat()
                 
                 validated_rules.append(rule)
             
@@ -298,35 +246,28 @@ Be MORE GRANULAR. If a sentence mentions multiple limits or conditions, create S
                 "rules": validated_rules,
                 "categories": sorted(list(categories_set)),
                 "company": company,
-                "extracted_at": datetime.utcnow().isoformat(),
+                "extracted_at": datetime.now(timezone.utc).isoformat(),
                 "total_rules": len(validated_rules)
             }
             
-            logger.info(f"✅ Final result: {len(validated_rules)} rules across {len(categories_set)} categories")
+            logger.info(f"✅ Final: {len(validated_rules)} unique rules across {len(categories_set)} categories")
             return result
             
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ JSON parsing error: {e}")
-            logger.error(f"Raw response preview: {result_text[:500] if 'result_text' in locals() else 'N/A'}")
-            return self._enhanced_fallback_extraction(policy_text, company)
-        
         except Exception as e:
-            logger.error(f"❌ Error parsing policy: {e}")
+            logger.error(f"❌ Error parsing policy: {e}", exc_info=True)
             return self._enhanced_fallback_extraction(policy_text, company)
     
     def _normalize_category(self, category: str) -> str:
-        """Normalize category to standard taxonomy."""
+        """Normalize category to standard taxonomy"""
         if not category:
             return "Other"
         
         category_lower = category.lower().strip()
         
-        # Direct match
         for std_cat in self.STANDARD_CATEGORIES.keys():
             if category_lower == std_cat.lower():
                 return std_cat
         
-        # Fuzzy match using keywords
         for std_cat, keywords in self.STANDARD_CATEGORIES.items():
             if any(kw in category_lower for kw in keywords):
                 return std_cat
@@ -334,150 +275,75 @@ Be MORE GRANULAR. If a sentence mentions multiple limits or conditions, create S
         return "Other"
     
     def _infer_severity(self, rule: Dict[str, Any]) -> str:
-        """Infer severity from rule attributes."""
+        """Infer severity from rule content"""
         attrs = rule.get('attributes', {})
+        raw_text = rule.get('raw_text', '').lower()
+        rule_type = rule.get('rule_type', 'positive')
         
-        # High severity if:
-        if attrs.get('max_amount') or attrs.get('disallowed_modes'):
+        high_indicators = [
+            attrs.get('max_amount') is not None,
+            attrs.get('time_limit_days') is not None,
+            attrs.get('receipt_required') == True,
+            attrs.get('approval_required') == True,
+            'mandatory' in raw_text,
+            'must' in raw_text,
+            'required' in raw_text,
+            'prohibited' in raw_text,
+            'not allowed' in raw_text,
+            rule_type == 'negative'  # Negative rules (prohibitions) are high severity
+        ]
+        
+        if any(high_indicators):
             return "HIGH"
         
-        conditions = attrs.get('conditions', [])
-        if any(c in str(conditions).lower() for c in ['approval', 'manager', 'authorization']):
-            return "HIGH"
+        medium_indicators = [
+            'should' in raw_text,
+            'recommend' in raw_text,
+            'may apply' in raw_text,
+            'preferred' in raw_text,
+        ]
         
-        # Medium severity if has restrictions
-        if attrs.get('allowed_modes') or attrs.get('domestic_only') or attrs.get('grade_restrictions'):
+        if any(medium_indicators):
             return "MEDIUM"
         
         return "LOW"
     
     def _enhanced_fallback_extraction(self, policy_text: str, company: str) -> Dict[str, Any]:
-        """Enhanced fallback with better rule detection"""
-        logger.warning("⚠️ Using enhanced fallback extraction...")
+        """Fallback extraction"""
+        logger.warning("⚠️ Using fallback extraction...")
         
         rules = []
-        categories_set = set()
+        categories_set = {"Other"}
         
-        # Multiple splitting strategies
-        segments = []
+        segments = re.split(r'[\n\r]+\s*[\u2022\-\*•]\s*|\n\s*\d+[\.)]\s*', policy_text)
         
-        # Strategy 1: Split by bullets and numbered lists
-        bullet_pattern = r'[\n\r]+\s*[\u2022\u2023\u25E6\-\*•]\s*|\n\s*\d+[\.)]\s*'
-        for part in re.split(bullet_pattern, policy_text):
-            part = part.strip()
-            if len(part) > 20:
-                segments.append(part)
-        
-        # Strategy 2: Split remaining by sentence boundaries
-        expanded_segments = []
-        for seg in segments:
-            # Split on period followed by capital letter or number
-            sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', seg)
-            expanded_segments.extend([s.strip() for s in sentences if len(s.strip()) > 20])
-        
-        # Strategy 3: Split on semicolons (often separate rules)
-        final_segments = []
-        for seg in expanded_segments:
-            if ';' in seg:
-                final_segments.extend([s.strip() for s in seg.split(';') if len(s.strip()) > 15])
-            else:
-                final_segments.append(seg)
-        
-        # Enhanced patterns
-        amount_pattern = re.compile(r'(?:INR|Rs\.?|₹)\s*([0-9][0-9,]*(?:\.\d+)?)', re.IGNORECASE)
-        per_pattern = re.compile(r'per\s+(day|month|trip|person|year|night|visit|journey)', re.IGNORECASE)
-        max_pattern = re.compile(r'(?:up\s+to|maximum|max|limit|not\s+exceed)', re.IGNORECASE)
-        
-        for idx, text in enumerate(final_segments):
-            text_lower = text.lower()
-            
-            # Detect category
-            category = self._detect_category_keywords(text)
-            categories_set.add(category)
-            
-            # Extract amount
-            max_amount = None
-            amount_match = amount_pattern.search(text)
-            if amount_match:
-                try:
-                    max_amount = float(amount_match.group(1).replace(',', ''))
-                except:
-                    pass
-            
-            # Extract scope
-            scope = None
-            per_match = per_pattern.search(text)
-            if per_match:
-                scope = f"per_{per_match.group(1).lower()}"
-            
-            # Detect conditions
-            conditions = []
-            if 'receipt' in text_lower:
-                conditions.append('receipt_required')
-            if 'approval' in text_lower:
-                if 'prior' in text_lower or 'advance' in text_lower:
-                    conditions.append('prior_approval')
-                if 'manager' in text_lower:
-                    conditions.append('manager_approval')
-                if 'hr' in text_lower:
-                    conditions.append('HR_approval')
-            
-            # Detect restrictions
-            disallowed = []
-            negative_phrases = ['not reimbursable', 'not allowed', 'prohibited', 
-                              'not permitted', 'excluded', 'disallowed', 'not covered']
-            for phrase in negative_phrases:
-                if phrase in text_lower:
-                    # Extract what's being disallowed
-                    words = text.split()
-                    for i, word in enumerate(words):
-                        if phrase.split()[0] in word.lower():
-                            if i > 0:
-                                disallowed.append(words[i-1].lower())
-            
-            # Determine severity
-            severity = "HIGH" if (max_amount or disallowed or 'approval' in text_lower) else "MEDIUM"
+        for idx, text in enumerate(segments):
+            text = text.strip()
+            if len(text) < 20:
+                continue
             
             rule = {
                 "rule_id": f"r{idx+1}",
-                "category": category,
-                "attributes": {
-                    "max_amount": max_amount,
-                    "currency": "INR" if max_amount else None,
-                    "scope": scope,
-                    "disallowed_modes": disallowed if disallowed else None,
-                    "conditions": conditions if conditions else None,
-                },
+                "category": "Other",
+                "rule_type": "negative" if any(word in text.lower() for word in ['not', 'prohibited', 'cannot', 'disallowed']) else "positive",
+                "attributes": {},
                 "raw_text": text,
-                "severity": severity,
+                "severity": "HIGH" if any(word in text.lower() for word in ['must', 'required', 'mandatory', 'prohibited']) else "MEDIUM",
                 "applies_to": "all_employees",
                 "company": company,
-                "extracted_at": datetime.utcnow().isoformat()
+                "extracted_at": datetime.now(timezone.utc).isoformat()
             }
             
             rules.append(rule)
-        
-        logger.info(f"📊 Fallback extracted {len(rules)} rules")
         
         return {
             "rules": rules,
             "categories": sorted(list(categories_set)),
             "company": company,
-            "extracted_at": datetime.utcnow().isoformat(),
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
             "total_rules": len(rules)
         }
     
-    def _detect_category_keywords(self, text: str) -> str:
-        """Detect category from text using keyword matching."""
-        text_lower = text.lower()
-        
-        # Try each category's keywords
-        for category, keywords in self.STANDARD_CATEGORIES.items():
-            if any(keyword in text_lower for keyword in keywords):
-                return category
-        
-        return "Other"
-    
     def get_category_list(self, company: str) -> List[str]:
-        """Get standard categories."""
+        """Get standard categories"""
         return list(self.STANDARD_CATEGORIES.keys())

@@ -5,7 +5,7 @@ import os
 import json
 import re
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime,timezone
 import logging
 from dotenv import load_dotenv
 
@@ -95,7 +95,7 @@ If data missing, use "N/A" or 0. Return only valid JSON.
                 "bill_id": bill_id,
                 "bill_meta": bill_meta,
                 "raw_text": clean_text,
-                "parsed_at": datetime.utcnow().isoformat(),
+                "parsed_at": datetime.now(timezone.utc).isoformat(),
                 "confidence": 0.9
             }
 
@@ -174,7 +174,7 @@ If data missing, use "N/A" or 0. Return only valid JSON.
             "bill_id": bill_id,
             "bill_meta": bill_meta,
             "raw_text": bill_text,
-            "parsed_at": datetime.utcnow().isoformat(),
+            "parsed_at": datetime.now(timezone.utc).isoformat(),
             "confidence": 0.55
         }
 

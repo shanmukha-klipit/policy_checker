@@ -1,9 +1,9 @@
-# database/mongodb_client.py - MongoDB operations with restructured schema
+# database/mongodb_client.py - Complete corrected implementation
 
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import os
 import logging
 
@@ -11,29 +11,90 @@ logger = logging.getLogger(__name__)
 
 class MongoDBClient:
     """
-    MongoDB client for storing policies and compliance checks.
-    Uses two collections:
-    1. policy_rules - Stores complete policy information with rules, embeddings, categories
-    2. compliance_checks - Stores compliance check results with violations
+    MongoDB client with dynamic connection switching for different environments
     """
     
     def __init__(self, db_name: str = None):
-        # MongoDB connection
-        mongo_uri = os.getenv("MONGODB_URI")
-        self.client = MongoClient(mongo_uri)
+        # 🆕 UPDATED: Store environment configurations
+        self.environment_configs = {
+            'dev': {
+                'web_origins': [os.getenv("DB_MAP_DEV_WEB")],
+                'mobile_origins': [os.getenv("DB_MAP_DEV_MOBILE")],
+                'db_name': os.getenv("DB_NAME_DEV"),
+                'mongo_uri': os.getenv("MONGODB_URI_DEV")
+            },
+            'staging': {
+                'web_origins': [os.getenv("DB_MAP_STAGING_WEB")],
+                'mobile_origins': [os.getenv("DB_MAP_STAGING_MOBILE")],
+                'db_name': os.getenv("DB_NAME_STAGING"),
+                'mongo_uri': os.getenv("MONGODB_URI_STAGING")
+            },
+            'prod': {
+                'web_origins': [os.getenv("DB_MAP_PROD_WEB")],
+                'mobile_origins': [os.getenv("DB_MAP_PROD_MOBILE")],
+                'db_name': os.getenv("DB_NAME_PROD"),
+                'mongo_uri': os.getenv("MONGODB_URI_PROD")
+            }
+        }
         
-        # Use provided db_name or default to 'klipit'
-        db_name = db_name or os.getenv("MONGODB_DB_NAME")
-        self.db = self.client[db_name]
+        # Remove None values
+        for env in list(self.environment_configs.keys()):
+            config = self.environment_configs[env]
+            config = {k: v for k, v in config.items() if v}
+            if not config:
+                del self.environment_configs[env]
+            else:
+                self.environment_configs[env] = config
         
-        # Collections - only two now
+        # Default connection (fallback)
+        self.default_mongo_uri = os.getenv("MONGODB_URI")
+        self.default_db_name = db_name or os.getenv("MONGODB_DB_NAME", "klipit")
+        
+        # Current connection state
+        self.current_env = 'default'
+        self.client = None
+        self.db = None
+        
+        # Initialize with default connection
+        self._initialize_connection(self.default_mongo_uri, self.default_db_name)
+        
+        # Collections
         self.policy_rules = self.db['policy_rules']
         self.compliance_checks = self.db['compliance_checks']
+        
+        # Request metadata
+        self.origin = None
+        self.referer = None
+        self.client_ip = None
         
         # Create indexes
         self._create_indexes()
         
-        logger.info(f"MongoDB client initialized with database: {db_name}")
+        logger.info(f"✅ MongoDB client initialized with default database: {self.default_db_name}")
+        logger.info(f"🌍 Available environments: {list(self.environment_configs.keys())}")
+    
+    def _initialize_connection(self, mongo_uri: str, db_name: str):
+        """Initialize or reinitialize MongoDB connection"""
+        try:
+            # Close existing connection if any
+            if self.client:
+                self.client.close()
+            
+            # Create new connection
+            self.client = MongoClient(mongo_uri)
+            self.db = self.client[db_name]
+            
+            logger.info(f"🔗 MongoDB connected to: {db_name}")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to connect to MongoDB: {e}")
+            # Fallback to default connection
+            if mongo_uri != self.default_mongo_uri:
+                logger.info("🔄 Falling back to default MongoDB connection")
+                self.client = MongoClient(self.default_mongo_uri)
+                self.db = self.client[self.default_db_name]
+            else:
+                raise
     
     def _create_indexes(self):
         """Create necessary indexes for efficient queries."""
@@ -42,7 +103,7 @@ class MongoDBClient:
             self.policy_rules.create_index([("company", ASCENDING)])
             self.policy_rules.create_index([("policy_name", ASCENDING)])
             self.policy_rules.create_index([("company", ASCENDING), ("policy_name", ASCENDING)], unique=True)
-            self.policy_rules.create_index([("effective_from", DESCENDING)])
+            self.policy_rules.create_index([("status", ASCENDING)])
             self.policy_rules.create_index([("time_uploaded", DESCENDING)])
             
             # Compliance checks indexes
@@ -50,43 +111,113 @@ class MongoDBClient:
             self.compliance_checks.create_index([("time_uploaded", DESCENDING)])
             self.compliance_checks.create_index([("company", ASCENDING), ("time_uploaded", DESCENDING)])
             
-            logger.info("Database indexes created successfully")
+            logger.info("✅ Database indexes created successfully")
         except Exception as e:
-            logger.warning(f"Index creation warning: {e}")
+            logger.warning(f"⚠️ Index creation warning: {e}")
+    
+    def _detect_environment_from_origin(self, origin: str) -> str:
+        """
+        Detect environment from origin
+        Returns: 'dev', 'staging', 'prod', or 'default'
+        """
+        if not origin:
+            return 'default'
+        
+        origin_lower = origin.lower()
+        
+        # Check each environment's origins
+        for env, config in self.environment_configs.items():
+            # Check web origins
+            web_origins = config.get('web_origins', [])
+            for web_origin in web_origins:
+                if web_origin and web_origin.lower() in origin_lower:
+                    return env
+            
+            # Check mobile origins
+            mobile_origins = config.get('mobile_origins', [])
+            for mobile_origin in mobile_origins:
+                if mobile_origin and mobile_origin.lower() in origin_lower:
+                    return env
+        
+        # Specific pattern matching as fallback
+        if "localhost" in origin_lower or "dev" in origin_lower:
+            return 'dev'
+        elif "staging" in origin_lower:
+            return 'staging'
+        elif "business.klipit.co" in origin_lower:
+            return 'prod'
+        
+        return 'default'
+    
+    def switch_db_based_on_origin(self, origin: str):
+        """
+        🆕 UPDATED: Switch database connection based on origin
+        Changes both MongoDB URI and database name
+        """
+        if not origin:
+            logger.warning("⚠️ No origin provided, using default connection")
+            return
+        
+        # Detect environment from origin
+        detected_env = self._detect_environment_from_origin(origin)
+        
+        # If already connected to the correct environment, do nothing
+        if detected_env == self.current_env:
+            logger.debug(f"✅ Already connected to {detected_env} environment")
+            return
+        
+        # Get environment configuration
+        env_config = self.environment_configs.get(detected_env)
+        
+        if env_config:
+            # Switch to environment-specific connection
+            mongo_uri = env_config.get('mongo_uri') or self.default_mongo_uri
+            db_name = env_config.get('db_name') or self.default_db_name
+            
+            try:
+                self._initialize_connection(mongo_uri, db_name)
+                self.current_env = detected_env
+                
+                # Update collections reference
+                self.policy_rules = self.db['policy_rules']
+                self.compliance_checks = self.db['compliance_checks']
+                
+                logger.info(f"✅ Switched to {detected_env.upper()} environment")
+                logger.info(f"   Database: {db_name}")
+                logger.info(f"   Origin: {origin}")
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to switch to {detected_env} environment: {e}")
+                # Fallback to default connection
+                self._initialize_connection(self.default_mongo_uri, self.default_db_name)
+                self.current_env = 'default'
+        else:
+            # Use default connection for unknown origins
+            if self.current_env != 'default':
+                self._initialize_connection(self.default_mongo_uri, self.default_db_name)
+                self.current_env = 'default'
+                logger.warning(f"⚠️ Unknown origin '{origin}', using default connection")
+    
+    # 🆕 NEW: Method to get current connection info
+    def get_connection_info(self) -> Dict[str, Any]:
+        """Get current connection information"""
+        return {
+            'environment': self.current_env,
+            'database': self.db.name if self.db else 'unknown',
+            'origin': self.origin
+        }
+
+    # ============================================================================
+    # EXISTING METHODS - Keep all your existing functionality
+    # ============================================================================
     
     def store_policy(self, policy_data: Dict[str, Any]) -> bool:
-
         """
         Store complete policy information in a single document.
-        
-        Expected policy_data structure:
-        {
-            "company": str,
-            "file_path": str,
-            "policy_name": str,
-            "description": str (optional),  # NEW: Added description
-            "rules_extracted": [
-                {
-                    "rule_id": str,
-                    "rule_text": str,
-                    "category": str,
-                    "embedding": List[float],
-                    "conditions": List[str],
-                    "amount_limit": float (optional),
-                    ...
-                }
-            ],
-            "effective_from": str (ISO format),
-            "effective_to": str (ISO format, optional),
-            "categories": List[str],
-            "embeddings_model": str (optional),
-            "total_rules": int,
-            "version": str (optional)
-        }
         """
         try:
             # Add metadata
-            current_time = datetime.utcnow()
+            current_time = datetime.now(timezone.utc)
             policy_data['time_uploaded'] = current_time.isoformat()
             policy_data['last_updated'] = current_time.isoformat()
             
@@ -94,21 +225,15 @@ class MongoDBClient:
             if 'total_rules' not in policy_data:
                 policy_data['total_rules'] = len(policy_data.get('rules_extracted', []))
             
+            # Set default status to 'inactive' if not provided
             if 'status' not in policy_data:
-                # Check if policy is currently active
-                effective_from = datetime.fromisoformat(policy_data.get('effective_from', current_time.isoformat()))
-                effective_to = policy_data.get('effective_to')
-                
-                if effective_to:
-                    effective_to_dt = datetime.fromisoformat(effective_to)
-                    if current_time < effective_from:
-                        policy_data['status'] = 'scheduled'
-                    elif current_time > effective_to_dt:
-                        policy_data['status'] = 'expired'
-                    else:
-                        policy_data['status'] = 'active'
-                else:
-                    policy_data['status'] = 'active' if current_time >= effective_from else 'scheduled'
+                policy_data['status'] = 'inactive'
+                logger.info("Status not provided, defaulting to 'inactive'")
+            
+            # Validate status value
+            if policy_data['status'] not in ['active', 'inactive']:
+                logger.warning(f"Invalid status '{policy_data['status']}', defaulting to 'inactive'")
+                policy_data['status'] = 'inactive'
             
             # Extract unique categories from rules if not provided
             if 'categories' not in policy_data or not policy_data['categories']:
@@ -129,9 +254,9 @@ class MongoDBClient:
             )
             
             if result.upserted_id:
-                logger.info(f"Created new policy: {policy_data['company']} - {policy_data['policy_name']}")
+                logger.info(f"Created new policy: {policy_data['company']} - {policy_data['policy_name']} (status: {policy_data['status']})")
             else:
-                logger.info(f"Updated existing policy: {policy_data['company']} - {policy_data['policy_name']}")
+                logger.info(f"Updated existing policy: {policy_data['company']} - {policy_data['policy_name']} (status: {policy_data['status']})")
             
             return True
         except Exception as e:
@@ -149,7 +274,7 @@ class MongoDBClient:
                     "policy_name": policy_name
                 })
             else:
-                # Get most recent active policy
+                # Get most recent active policy using status field
                 policy = self.policy_rules.find_one(
                     {
                         "company": company,
@@ -195,36 +320,9 @@ class MongoDBClient:
     def store_compliance_check(self, check_data: Dict[str, Any]) -> bool:
         """
         Store compliance check result.
-        
-        Expected check_data structure:
-        {
-            "company": str,
-            "file_path": str,
-            "violations": [
-                {
-                    "bill_item_id": str,
-                    "violation_type": str,
-                    "description": str,
-                    "severity": str,
-                    "rule_violated": str,
-                    ...
-                }
-            ],
-            "classification": {
-                "compliant_items": int,
-                "non_compliant_items": int,
-                "total_items": int,
-                "compliance_score": float,
-                "categories_checked": List[str]
-            },
-            "bill_id": str (optional),
-            "policy_name": str (optional),
-            "checked_by": str (optional),
-            "metadata": Dict (optional)
-        }
         """
         try:
-            current_time = datetime.utcnow()
+            current_time = datetime.now(timezone.utc)
             
             # Add timestamps
             check_data['time_uploaded'] = current_time.isoformat()
@@ -262,7 +360,7 @@ class MongoDBClient:
         except Exception as e:
             logger.error(f"Error storing compliance check: {e}")
             return False
-    
+        
     def get_compliance_check(self, check_id: str) -> Optional[Dict[str, Any]]:
         """
         Retrieve a specific compliance check by ID.
@@ -300,15 +398,17 @@ class MongoDBClient:
     def get_statistics(self, company: str) -> Dict[str, Any]:
         """
         Get comprehensive statistics for a company.
+        ✅ UPDATED: Uses status field for active policy detection
         """
         try:
             # Get policy stats
             policy = self.get_policy(company)
             policy_stats = {
-                "has_active_policy": policy is not None,
+                "has_active_policy": policy is not None and policy.get('status') == 'active',  # ✅ UPDATED
                 "total_rules": policy.get('total_rules', 0) if policy else 0,
                 "categories": policy.get('categories', []) if policy else [],
-                "policy_name": policy.get('policy_name', 'N/A') if policy else 'N/A'
+                "policy_name": policy.get('policy_name', 'N/A') if policy else 'N/A',
+                "status": policy.get('status', 'inactive') if policy else 'inactive'  # ✅ UPDATED
             }
             
             # Get compliance check stats
@@ -449,7 +549,7 @@ class MongoDBClient:
             query = {"company": company}
             
             if older_than_days:
-                cutoff_date = datetime.utcnow() - timedelta(days=older_than_days)
+                cutoff_date = datetime.now(timezone.utc) - timedelta(days=older_than_days)
                 query["time_uploaded"] = {"$lt": cutoff_date.isoformat()}
             
             result = self.compliance_checks.delete_many(query)
@@ -473,6 +573,7 @@ class MongoDBClient:
     def list_policies(self, company: str) -> List[Dict[str, Any]]:
         """
         List all policies for a company with summary information.
+        ✅ UPDATED: Returns status field instead of effective dates
         """
         try:
             policies = list(
@@ -481,9 +582,7 @@ class MongoDBClient:
                     {
                         "policy_name": 1,
                         "time_uploaded": 1,
-                        "effective_from": 1,
-                        "effective_to": 1,
-                        "status": 1,
+                        "status": 1,  # ✅ UPDATED: Return status instead of dates
                         "total_rules": 1,
                         "categories": 1,
                         "_id": 0
@@ -498,6 +597,7 @@ class MongoDBClient:
     def get_policies_by_company(self, company: str):
         """
         Fetch all policy documents for a company.
+        ✅ UPDATED: Returns status field instead of effective dates
         """
         try:
             # Use policy_rules collection instead of policies
@@ -507,13 +607,11 @@ class MongoDBClient:
                     "_id": 1,
                     "policy_name": 1,
                     "description": 1,
-                    "status": 1,
-                    "effective_from": 1,
-                    "effective_to": 1,
+                    "status": 1,  # ✅ UPDATED: Fetch status instead of dates
                     "categories": 1,
                     "total_rules": 1,
-                    "last_updated": 1,  # Changed from updated_at to last_updated
-                    "time_uploaded": 1   # Also include time_uploaded as fallback
+                    "last_updated": 1,
+                    "time_uploaded": 1
                 }
             ))
             
@@ -523,9 +621,7 @@ class MongoDBClient:
                 formatted_policy = {
                     "policy_name": policy.get("policy_name"),
                     "description": policy.get("description", ""),
-                    "status": policy.get("status", "active"),
-                    "effective_from": policy.get("effective_from"),
-                    "effective_to": policy.get("effective_to"),
+                    "status": policy.get("status", "inactive"),  # ✅ UPDATED: Use status field
                     "total_rules": policy.get("total_rules", 0),
                     "categories": policy.get("categories", []),
                     "last_updated": policy.get("last_updated") or policy.get("time_uploaded"),
@@ -540,6 +636,9 @@ class MongoDBClient:
             return []
         
     def get_policy_by_name(self, company: str, policy_name: str):
+        """
+        Fetch a specific policy by company and policy name.
+        """
         try:
             collection = self.db["policy_rules"]
             policy = collection.find_one({"company": company, "policy_name": policy_name})
@@ -549,11 +648,25 @@ class MongoDBClient:
             return None
         
     def update_policy(self, company: str, policy_name: str, updated_fields: dict):
+        """
+        Update a policy with new fields.
+        ✅ UPDATED: Validates status field if provided
+        """
         try:
+            # ✅ UPDATED: Validate status if being updated
+            if 'status' in updated_fields:
+                if updated_fields['status'] not in ['active', 'inactive']:
+                    logger.warning(f"Invalid status value: {updated_fields['status']}, defaulting to 'inactive'")
+                    updated_fields['status'] = 'inactive'
+            
             result = self.db["policy_rules"].update_one(
                 {"company": company, "policy_name": policy_name},
                 {"$set": updated_fields}
             )
+            
+            if result.modified_count > 0:
+                logger.info(f"Updated policy {policy_name} for company {company}")
+            
             return result.modified_count > 0
         except Exception as e:
             logging.error(f"Error updating policy: {e}")
@@ -562,6 +675,7 @@ class MongoDBClient:
     def get_expense_by_id(self, expense_id: str) -> Optional[Dict[str, Any]]:
         """
         Retrieve an expense from manual_expenses collection by ID.
+        FIXED: Properly serializes all nested ObjectIds in items.
         
         Args:
             expense_id: The expense document ID (string or ObjectId)
@@ -587,41 +701,83 @@ class MongoDBClient:
                 logger.warning(f"Expense not found with ID: {expense_id}")
                 return None
             
-            # Convert ObjectId to string for JSON serialization
-            if '_id' in expense:
-                expense['_id'] = str(expense['_id'])
+            # ✅ FIX: Process items to convert ObjectIds to strings
+            items = []
+            for item in expense.get("items", []):
+                processed_item = {
+                    "name": item.get("name", ""),
+                    "amount": item.get("amount", 0),
+                    "category": item.get("category", "Other"),
+                    "quantity": item.get("quantity", 1),  # Add if exists
+                }
+                # Convert item _id if it exists
+                if "_id" in item:
+                    processed_item["_id"] = str(item["_id"])
+                items.append(processed_item)
             
-            # Extract relevant fields
+            # ✅ FIX: Convert ObjectId fields in breakdown if present
+            breakdown = []
+            for b in expense.get("breakdown", []):
+                breakdown_item = {
+                    "amount": b.get("amount", 0),
+                    "originalAmount": b.get("originalAmount", 0),
+                }
+                if "category" in b and isinstance(b["category"], ObjectId):
+                    breakdown_item["category"] = str(b["category"])
+                breakdown.append(breakdown_item)
+            
+            # ✅ FIX: Handle customer ObjectId
+            customer_id = expense.get("customer")
+            if isinstance(customer_id, ObjectId):
+                customer_id = str(customer_id)
+            
+            # ✅ FIX: Handle pdfBase64Data ObjectId
+            pdf_data_id = expense.get("pdfBase64Data")
+            if isinstance(pdf_data_id, ObjectId):
+                pdf_data_id = str(pdf_data_id)
+            
+            # Build expense data with proper serialization
             expense_data = {
-                "_id": expense.get("_id"),
-                "title": expense.get("title"),
-                "date": expense.get("date"),
-                "currency": expense.get("currency"),
-                "originalAmount": expense.get("originalAmount"),
-                "totalAmount": expense.get("totalAmount"),
+                "_id": str(expense.get("_id")),
+                "title": expense.get("title", "Unknown Vendor"),
+                "date": expense.get("date"),  # datetime object
+                "currency": expense.get("currency", "INR"),
+                "originalAmount": expense.get("originalAmount", 0),
+                "totalAmount": expense.get("totalAmount", 0),
                 "convertedCurrency": expense.get("convertedCurrency"),
-                "items": expense.get("items", []),
+                "convertedAmount": expense.get("convertedAmount"),
+                "items": items,  # ✅ Processed items
                 "receiptId": expense.get("receiptId"),
-                "retailer": expense.get("retailer"),
+                "retailer": expense.get("retailer") or expense.get("title", "Unknown Vendor"),
                 "time": expense.get("time"),
                 "fileUrl": expense.get("fileUrl"),
-                "status": expense.get("status"),
-                "numberOfItems": expense.get("numberOfItems", 0),
+                "status": expense.get("status", "pending"),
+                "numberOfItems": expense.get("numberOfItems", len(items)),
+                "breakdown": breakdown,  # ✅ Processed breakdown
+                "customer": customer_id,
+                "pdfBase64Data": pdf_data_id,
+                "paymentMode": expense.get("paymentMode", "N/A"),  # Optional field
+                "origin": expense.get("origin"),  # Optional field
+                "destination": expense.get("destination"),  # Optional field,
             }
             
-            logger.info(f"Retrieved expense: {expense_data.get('title')} with {len(expense_data.get('items', []))} items")
+            logger.info(
+                f"✅ Retrieved expense: {expense_data.get('title')} "
+                f"with {len(items)} items, total: {expense_data.get('totalAmount')} "
+                f"{expense_data.get('currency')}"
+            )
             return expense_data
             
         except Exception as e:
-            logger.error(f"Error retrieving expense by ID: {e}", exc_info=True)
+            logger.error(f"❌ Error retrieving expense by ID: {e}", exc_info=True)
             return None
         
     def get_compliance_by_expense_id(self, expense_id: str):
         """Fetch compliance result if already exists for this expense"""
         return self.compliance_checks.find_one({"expense_id": expense_id})
-
     
     def close(self):
         """Close MongoDB connection."""
-        self.client.close()
-        logger.info("MongoDB connection closed")
+        if self.client:
+            self.client.close()
+            logger.info("🔌 MongoDB connection closed")

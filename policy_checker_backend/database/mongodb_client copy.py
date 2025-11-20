@@ -3,7 +3,7 @@
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime,timezone
 import os
 import logging
 
@@ -60,7 +60,7 @@ class MongoDBClient:
             # Add company identifier to each rule
             for rule in rules:
                 rule['company'] = company
-                rule['created_at'] = datetime.utcnow().isoformat()
+                rule['created_at'] = datetime.now(timezone.utc).isoformat()
             
             # Delete existing rules for this company (policy update)
             self.rules.delete_many({"company": company})
@@ -77,8 +77,8 @@ class MongoDBClient:
                 "company": company,
                 "rules_count": len(rules),
                 "allowed_categories": allowed_categories,
-                "uploaded_at": datetime.utcnow().isoformat(),
-                "version": datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                "version": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
             }
             
             self.policies.replace_one(
@@ -110,7 +110,7 @@ class MongoDBClient:
     def store_bill(self, bill_data: Dict[str, Any]) -> bool:
         """Store parsed bill data."""
         try:
-            bill_data['stored_at'] = datetime.utcnow().isoformat()
+            bill_data['stored_at'] = datetime.now(timezone.utc).isoformat()
             
             self.bills.replace_one(
                 {"bill_id": bill_data['bill_id']},
@@ -127,8 +127,8 @@ class MongoDBClient:
     def store_compliance_check(self, check_data: Dict[str, Any]) -> bool:
         """Store compliance check result."""
         try:
-            check_data['_id'] = f"{check_data['company']}_{datetime.utcnow().timestamp()}"
-            check_data['timestamp'] = datetime.utcnow().isoformat()
+            check_data['_id'] = f"{check_data['company']}_{datetime.now(timezone.utc).timestamp()}"
+            check_data['timestamp'] = datetime.now(timezone.utc).isoformat()
             
             self.compliance_checks.insert_one(check_data)
             
@@ -293,7 +293,7 @@ class MongoDBClient:
                 {"company": company},
                 {"$set": {
                     "categories": categories,
-                    "last_updated": datetime.utcnow().isoformat()
+                    "last_updated": datetime.now(timezone.utc).isoformat()
                 }},
                 upsert=True
             )
