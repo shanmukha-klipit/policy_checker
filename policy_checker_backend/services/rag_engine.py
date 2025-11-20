@@ -1,5 +1,3 @@
-# services/optimized_rag_engine_FIXED.py - With proper error handling and batching
-
 import os
 from typing import List, Dict, Any, Optional
 import logging
@@ -19,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class RAGEngine:
     """
-    Optimized RAG Engine with dynamic MongoDB connections
+    Optimized RAG Engine with consistent dynamic MongoDB connections
     """
     
     def __init__(self, origin: str = None):
@@ -34,20 +32,20 @@ class RAGEngine:
         logger.info(f"Using LLM model: {self.model_name}")
         logger.info(f"Using embedding model: {self.embedding_model}")
 
-        # 🆕 UPDATED: Initialize with dynamic connection
+        # 🆕 FIXED: Initialize with consistent connection logic
         self.origin = origin
         self.mongo_client = None
         self.db = None
         self.rules_collection = None
+        self.current_env = 'default'
         
         self._initialize_dynamic_connection(origin)
         
         logger.info(f"✅ RAG Engine initialized for origin: {origin or 'default'}")
 
-    def _initialize_dynamic_connection(self, origin: str = None):
-        """Initialize MongoDB connection dynamically based on origin"""
-        # 🆕 UPDATED: Environment configurations
-        environment_configs = {
+    def _load_environment_configs(self) -> Dict[str, Any]:
+        """Load and validate environment configurations (same as MongoDB client)"""
+        configs = {
             'dev': {
                 'web_origins': [os.getenv("DB_MAP_DEV_WEB")],
                 'mobile_origins': [os.getenv("DB_MAP_DEV_MOBILE")],
@@ -68,64 +66,160 @@ class RAGEngine:
             }
         }
         
-        # Default connection
+        # Remove environments with incomplete configuration
+        valid_configs = {}
+        for env, config in configs.items():
+            has_mongo_uri = bool(config.get('mongo_uri'))
+            has_db_name = bool(config.get('db_name'))
+            
+            if has_mongo_uri and has_db_name:
+                valid_configs[env] = config
+            else:
+                logger.warning(f"RAG Engine: ⚠️ {env.upper()} environment configuration incomplete")
+        
+        return valid_configs
+
+    def _get_default_db_name(self) -> str:
+        """Get the default database name with proper fallback logic"""
+        env_db_name = os.getenv("MONGODB_DB_NAME")
+        if env_db_name:
+            return env_db_name
+        
+        logger.warning("RAG Engine: ⚠️ No MONGODB_DB_NAME set, using default 'klipit'")
+        return "klipit"
+
+    def _detect_environment_from_origin(self, origin: str) -> str:
+        """
+        Detect environment from origin (consistent with MongoDB client)
+        Returns: 'dev', 'staging', 'prod', or 'default'
+        """
+        if not origin:
+            return 'default'
+        
+        origin_lower = origin.lower()
+        
+        # Check environment configurations
+        environment_configs = self._load_environment_configs()
+        for env, config in environment_configs.items():
+            # Check web origins
+            web_origins = config.get('web_origins', [])
+            for web_origin in web_origins:
+                if web_origin and web_origin.lower() in origin_lower:
+                    return env
+            
+            # Check mobile origins
+            mobile_origins = config.get('mobile_origins', [])
+            for mobile_origin in mobile_origins:
+                if mobile_origin and mobile_origin.lower() in origin_lower:
+                    return env
+        
+        # Pattern matching fallback
+        if "localhost" in origin_lower:
+            return 'dev'
+        elif "dev" in origin_lower:
+            return 'dev'
+        elif "staging" in origin_lower:
+            return 'staging'
+        elif "business.klipit.co" in origin_lower and "staging" not in origin_lower:
+            return 'prod'
+        
+        return 'default'
+
+    def _initialize_dynamic_connection(self, origin: str = None):
+        """Initialize MongoDB connection with consistent fallback logic"""
+        # Default connection parameters
         default_mongo_uri = os.getenv("MONGODB_URI")
-        default_db_name = os.getenv("MONGODB_DB_NAME", "klipit")
+        default_db_name = self._get_default_db_name()
+        
+        if not default_mongo_uri:
+            raise ValueError("MONGODB_URI environment variable is required for RAG Engine")
         
         # Detect environment
-        detected_env = 'default'
-        if origin:
-            origin_lower = origin.lower()
-            for env, config in environment_configs.items():
-                web_origins = config.get('web_origins', [])
-                mobile_origins = config.get('mobile_origins', [])
-                
-                if (any(wo and wo.lower() in origin_lower for wo in web_origins) or
-                    any(mo and mo.lower() in origin_lower for mo in mobile_origins)):
-                    detected_env = env
-                    break
-            
-            # Pattern matching fallback
-            if detected_env == 'default':
-                if "localhost" in origin_lower or "dev" in origin_lower:
-                    detected_env = 'dev'
-                elif "staging" in origin_lower:
-                    detected_env = 'staging'
-                elif "business.klipit.co" in origin_lower:
-                    detected_env = 'prod'
+        detected_env = self._detect_environment_from_origin(origin)
         
-        # Get connection parameters
-        if detected_env != 'default' and detected_env in environment_configs:
-            env_config = environment_configs[detected_env]
-            mongo_uri = env_config.get('mongo_uri') or default_mongo_uri
-            db_name = env_config.get('db_name') or default_db_name
+        # Get environment configuration
+        environment_configs = self._load_environment_configs()
+        env_config = environment_configs.get(detected_env)
+        
+        # Determine connection parameters
+        if env_config and detected_env != 'default':
+            mongo_uri = env_config.get('mongo_uri')
+            db_name = env_config.get('db_name')
+            
+            if not mongo_uri or not db_name:
+                logger.warning(f"RAG Engine: ⚠️ Incomplete configuration for {detected_env}, using default")
+                mongo_uri = default_mongo_uri
+                db_name = default_db_name
+                detected_env = 'default'
         else:
             mongo_uri = default_mongo_uri
             db_name = default_db_name
+            detected_env = 'default'
         
         # Initialize connection
         try:
+            # Close existing connection if any
+            if self.mongo_client:
+                self.mongo_client.close()
+            
             self.mongo_client = MongoClient(mongo_uri)
             self.db = self.mongo_client[db_name]
             self.rules_collection = self.db['policy_rules']
+            self.current_env = detected_env
+            
+            # Test connection
+            self.mongo_client.admin.command('ping')
             
             logger.info(f"✅ RAG Engine connected to {detected_env.upper()} environment")
             logger.info(f"   Database: {db_name}")
             logger.info(f"   Origin: {origin or 'default'}")
             
         except Exception as e:
-            logger.error(f"❌ Failed to initialize RAG Engine connection: {e}")
-            raise
+            logger.error(f"❌ RAG Engine failed to connect to {detected_env.upper()}: {e}")
+            
+            # Fallback to default connection
+            if mongo_uri != default_mongo_uri or db_name != default_db_name:
+                logger.info("RAG Engine: 🔄 Falling back to default connection")
+                try:
+                    self.mongo_client = MongoClient(default_mongo_uri)
+                    self.db = self.mongo_client[default_db_name]
+                    self.rules_collection = self.db['policy_rules']
+                    self.current_env = 'default'
+                    self.mongo_client.admin.command('ping')
+                    logger.info(f"✅ RAG Engine fallback successful to: {default_db_name}")
+                except Exception as fallback_error:
+                    logger.error(f"❌ RAG Engine fallback also failed: {fallback_error}")
+                    raise fallback_error
+            else:
+                raise
 
     def switch_database(self, origin: str):
         """
-        🆕 UPDATED: Switch database connection
+        🆕 FIXED: Switch database connection with consistent logic
         """
-        logger.info(f"🔄 RAG Engine switching database for origin: {origin}")
+        logger.info(f"RAG Engine: 🔄 Switching database for origin: {origin}")
+        
+        # If already connected to the correct environment, do nothing
+        detected_env = self._detect_environment_from_origin(origin)
+        if detected_env == self.current_env:
+            logger.debug(f"RAG Engine: ✅ Already connected to {detected_env} environment")
+            return
+        
         self.origin = origin
         self._initialize_dynamic_connection(origin)
 
+    def get_connection_info(self) -> Dict[str, Any]:
+        """Get current connection information"""
+        return {
+            'environment': self.current_env,
+            'database': self.db.name if self.db else 'unknown',
+            'origin': self.origin
+        }
 
+    # ============================================================================
+    # ALL YOUR EXISTING RAG METHODS REMAIN EXACTLY THE SAME
+    # ============================================================================
+    
     def generate_embedding(self, text: str, max_retries: int = 3) -> List[float]:
         """
         Generate embedding with exponential backoff and retry logic.
@@ -291,7 +385,7 @@ class RAGEngine:
         except Exception as e:
             logger.error(f"Error retrieving rules: {e}", exc_info=True)
             return []
-
+        
     def _format_all_rules(self, policy_rules: List[Dict[str, Any]]) -> str:
         """Format rules with clear structure"""
         lines = []

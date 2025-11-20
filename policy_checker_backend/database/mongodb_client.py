@@ -1,4 +1,4 @@
-# database/mongodb_client.py - Complete corrected implementation
+# database/mongodb_client.py - Fixed fallback logic
 
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
@@ -15,40 +15,16 @@ class MongoDBClient:
     """
     
     def __init__(self, db_name: str = None):
-        # 🆕 UPDATED: Store environment configurations
-        self.environment_configs = {
-            'dev': {
-                'web_origins': [os.getenv("DB_MAP_DEV_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_DEV_MOBILE")],
-                'db_name': os.getenv("DB_NAME_DEV"),
-                'mongo_uri': os.getenv("MONGODB_URI_DEV")
-            },
-            'staging': {
-                'web_origins': [os.getenv("DB_MAP_STAGING_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_STAGING_MOBILE")],
-                'db_name': os.getenv("DB_NAME_STAGING"),
-                'mongo_uri': os.getenv("MONGODB_URI_STAGING")
-            },
-            'prod': {
-                'web_origins': [os.getenv("DB_MAP_PROD_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_PROD_MOBILE")],
-                'db_name': os.getenv("DB_NAME_PROD"),
-                'mongo_uri': os.getenv("MONGODB_URI_PROD")
-            }
-        }
+        # 🆕 FIXED: Better environment configuration loading
+        self.environment_configs = self._load_environment_configs()
         
-        # Remove None values
-        for env in list(self.environment_configs.keys()):
-            config = self.environment_configs[env]
-            config = {k: v for k, v in config.items() if v}
-            if not config:
-                del self.environment_configs[env]
-            else:
-                self.environment_configs[env] = config
-        
-        # Default connection (fallback)
+        # 🆕 FIXED: Clear default connection parameters
         self.default_mongo_uri = os.getenv("MONGODB_URI")
-        self.default_db_name = db_name or os.getenv("MONGODB_DB_NAME", "klipit")
+        self.default_db_name = self._get_default_db_name(db_name)
+        
+        # Validate that we have at least default connection
+        if not self.default_mongo_uri:
+            raise ValueError("MONGODB_URI environment variable is required")
         
         # Current connection state
         self.current_env = 'default'
@@ -72,6 +48,72 @@ class MongoDBClient:
         
         logger.info(f"✅ MongoDB client initialized with default database: {self.default_db_name}")
         logger.info(f"🌍 Available environments: {list(self.environment_configs.keys())}")
+        logger.info(f"🔧 Default MongoDB URI: {self._mask_mongo_uri(self.default_mongo_uri)}")
+    
+    def _load_environment_configs(self) -> Dict[str, Any]:
+        """Load and validate environment configurations"""
+        configs = {
+            'dev': {
+                'web_origins': [os.getenv("DB_MAP_DEV_WEB")],
+                'mobile_origins': [os.getenv("DB_MAP_DEV_MOBILE")],
+                'db_name': os.getenv("DB_NAME_DEV"),
+                'mongo_uri': os.getenv("MONGODB_URI_DEV")
+            },
+            'staging': {
+                'web_origins': [os.getenv("DB_MAP_STAGING_WEB")],
+                'mobile_origins': [os.getenv("DB_MAP_STAGING_MOBILE")],
+                'db_name': os.getenv("DB_NAME_STAGING"),
+                'mongo_uri': os.getenv("MONGODB_URI_STAGING")
+            },
+            'prod': {
+                'web_origins': [os.getenv("DB_MAP_PROD_WEB")],
+                'mobile_origins': [os.getenv("DB_MAP_PROD_MOBILE")],
+                'db_name': os.getenv("DB_NAME_PROD"),
+                'mongo_uri': os.getenv("MONGODB_URI_PROD")
+            }
+        }
+        
+        # Remove environments with incomplete configuration
+        valid_configs = {}
+        for env, config in configs.items():
+            # Check if this environment has both mongo_uri and db_name
+            has_mongo_uri = bool(config.get('mongo_uri'))
+            has_db_name = bool(config.get('db_name'))
+            has_origins = bool(config.get('web_origins') or config.get('mobile_origins'))
+            
+            if has_mongo_uri and has_db_name:
+                valid_configs[env] = config
+                logger.info(f"   ✅ {env.upper()}: {config['db_name']}")
+            else:
+                logger.warning(f"   ⚠️ {env.upper()}: Incomplete configuration (missing URI or DB name)")
+        
+        return valid_configs
+    
+    def _get_default_db_name(self, db_name: str = None) -> str:
+        """Get the default database name with proper fallback logic"""
+        # Priority: 1. Provided db_name, 2. MONGODB_DB_NAME env, 3. Fallback to "klipit"
+        if db_name:
+            return db_name
+        
+        env_db_name = os.getenv("MONGODB_DB_NAME")
+        if env_db_name:
+            return env_db_name
+        
+        logger.warning("⚠️ No MONGODB_DB_NAME set, using default 'klipit'")
+        return "klipit"
+    
+    def _mask_mongo_uri(self, mongo_uri: str) -> str:
+        """Mask MongoDB URI for safe logging"""
+        if not mongo_uri:
+            return "None"
+        # Keep only the protocol and host, mask credentials
+        try:
+            parts = mongo_uri.split('@')
+            if len(parts) > 1:
+                return f"{parts[0].split('//')[0]}//***@***" + parts[1].split('/')[0]
+        except:
+            pass
+        return "***masked***"
     
     def _initialize_connection(self, mongo_uri: str, db_name: str):
         """Initialize or reinitialize MongoDB connection"""
@@ -80,20 +122,38 @@ class MongoDBClient:
             if self.client:
                 self.client.close()
             
+            # Validate parameters
+            if not mongo_uri:
+                raise ValueError("MongoDB URI cannot be empty")
+            if not db_name:
+                raise ValueError("Database name cannot be empty")
+            
             # Create new connection
             self.client = MongoClient(mongo_uri)
             self.db = self.client[db_name]
             
+            # Test connection
+            self.client.admin.command('ping')
+            
             logger.info(f"🔗 MongoDB connected to: {db_name}")
+            logger.debug(f"   URI: {self._mask_mongo_uri(mongo_uri)}")
             
         except Exception as e:
             logger.error(f"❌ Failed to connect to MongoDB: {e}")
-            # Fallback to default connection
-            if mongo_uri != self.default_mongo_uri:
+            
+            # Fallback to default connection only if this wasn't already the default
+            if mongo_uri != self.default_mongo_uri or db_name != self.default_db_name:
                 logger.info("🔄 Falling back to default MongoDB connection")
-                self.client = MongoClient(self.default_mongo_uri)
-                self.db = self.client[self.default_db_name]
+                try:
+                    self.client = MongoClient(self.default_mongo_uri)
+                    self.db = self.client[self.default_db_name]
+                    self.client.admin.command('ping')  # Test default connection
+                    logger.info(f"✅ Fallback successful to: {self.default_db_name}")
+                except Exception as fallback_error:
+                    logger.error(f"❌ Fallback connection also failed: {fallback_error}")
+                    raise fallback_error
             else:
+                # This was already the default connection, no fallback possible
                 raise
     
     def _create_indexes(self):
@@ -121,9 +181,11 @@ class MongoDBClient:
         Returns: 'dev', 'staging', 'prod', or 'default'
         """
         if not origin:
+            logger.debug("No origin provided, using default environment")
             return 'default'
         
         origin_lower = origin.lower()
+        logger.debug(f"Detecting environment for origin: {origin}")
         
         # Check each environment's origins
         for env, config in self.environment_configs.items():
@@ -131,28 +193,36 @@ class MongoDBClient:
             web_origins = config.get('web_origins', [])
             for web_origin in web_origins:
                 if web_origin and web_origin.lower() in origin_lower:
+                    logger.debug(f"Matched web origin: {web_origin} -> {env}")
                     return env
             
             # Check mobile origins
             mobile_origins = config.get('mobile_origins', [])
             for mobile_origin in mobile_origins:
                 if mobile_origin and mobile_origin.lower() in origin_lower:
+                    logger.debug(f"Matched mobile origin: {mobile_origin} -> {env}")
                     return env
         
         # Specific pattern matching as fallback
-        if "localhost" in origin_lower or "dev" in origin_lower:
+        if "localhost" in origin_lower:
+            logger.debug("Matched localhost pattern -> dev")
+            return 'dev'
+        elif "dev" in origin_lower:
+            logger.debug("Matched dev pattern -> dev")
             return 'dev'
         elif "staging" in origin_lower:
+            logger.debug("Matched staging pattern -> staging")
             return 'staging'
-        elif "business.klipit.co" in origin_lower:
+        elif "business.klipit.co" in origin_lower and "staging" not in origin_lower:
+            logger.debug("Matched production pattern -> prod")
             return 'prod'
         
+        logger.debug(f"No environment match found for origin: {origin}, using default")
         return 'default'
     
     def switch_db_based_on_origin(self, origin: str):
         """
-        🆕 UPDATED: Switch database connection based on origin
-        Changes both MongoDB URI and database name
+        🆕 FIXED: Switch database connection based on origin with better fallback
         """
         if not origin:
             logger.warning("⚠️ No origin provided, using default connection")
@@ -169,12 +239,18 @@ class MongoDBClient:
         # Get environment configuration
         env_config = self.environment_configs.get(detected_env)
         
-        if env_config:
+        if env_config and detected_env != 'default':
             # Switch to environment-specific connection
-            mongo_uri = env_config.get('mongo_uri') or self.default_mongo_uri
-            db_name = env_config.get('db_name') or self.default_db_name
+            mongo_uri = env_config.get('mongo_uri')
+            db_name = env_config.get('db_name')
+            
+            if not mongo_uri or not db_name:
+                logger.error(f"❌ Incomplete configuration for {detected_env} environment")
+                self._fallback_to_default(f"Incomplete {detected_env} configuration")
+                return
             
             try:
+                logger.info(f"🔄 Switching to {detected_env.upper()} environment...")
                 self._initialize_connection(mongo_uri, db_name)
                 self.current_env = detected_env
                 
@@ -188,15 +264,24 @@ class MongoDBClient:
                 
             except Exception as e:
                 logger.error(f"❌ Failed to switch to {detected_env} environment: {e}")
-                # Fallback to default connection
-                self._initialize_connection(self.default_mongo_uri, self.default_db_name)
-                self.current_env = 'default'
+                self._fallback_to_default(f"Switch to {detected_env} failed: {str(e)}")
         else:
-            # Use default connection for unknown origins
+            # Use default connection for unknown origins or 'default' environment
             if self.current_env != 'default':
-                self._initialize_connection(self.default_mongo_uri, self.default_db_name)
-                self.current_env = 'default'
-                logger.warning(f"⚠️ Unknown origin '{origin}', using default connection")
+                self._fallback_to_default(f"Unknown origin: {origin}")
+            else:
+                logger.debug(f"✅ Using default connection for origin: {origin}")
+    
+    def _fallback_to_default(self, reason: str):
+        """Fallback to default connection"""
+        logger.warning(f"🔄 Falling back to default connection: {reason}")
+        try:
+            self._initialize_connection(self.default_mongo_uri, self.default_db_name)
+            self.current_env = 'default'
+            logger.info(f"✅ Successfully fell back to default database: {self.default_db_name}")
+        except Exception as e:
+            logger.error(f"❌ Critical: Fallback to default connection also failed: {e}")
+            # At this point, we can't recover - the application should probably restart
     
     # 🆕 NEW: Method to get current connection info
     def get_connection_info(self) -> Dict[str, Any]:
@@ -204,9 +289,10 @@ class MongoDBClient:
         return {
             'environment': self.current_env,
             'database': self.db.name if self.db else 'unknown',
-            'origin': self.origin
+            'origin': self.origin,
+            'default_database': self.default_db_name,
+            'available_environments': list(self.environment_configs.keys())
         }
-
     # ============================================================================
     # EXISTING METHODS - Keep all your existing functionality
     # ============================================================================
