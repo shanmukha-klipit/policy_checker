@@ -47,15 +47,18 @@ class PolicyParser:
         """Generate a unique hash for a rule to detect duplicates"""
         normalized_text = ' '.join(rule_text.lower().split())
         
+        # FIX: Handle case where key exists but value is explicitly None (JSON null)
+        # using 'or []' ensures that if .get() returns None, we treat it as an empty list.
         key_attrs = {
             'max_amount': attributes.get('max_amount'),
             'min_amount': attributes.get('min_amount'),
-            'allowed_modes': sorted(attributes.get('allowed_modes', [])),
-            'disallowed_modes': sorted(attributes.get('disallowed_modes', [])),
-            'conditions': sorted(attributes.get('conditions', []))
+            'allowed_modes': sorted(attributes.get('allowed_modes') or []),
+            'disallowed_modes': sorted(attributes.get('disallowed_modes') or []),
+            'conditions': sorted(attributes.get('conditions') or [])
         }
         
-        hash_input = f"{normalized_text}|{category}|{json.dumps(key_attrs, sort_keys=True)}"
+        # Use default=str in json.dumps to handle any unexpected types cleanly
+        hash_input = f"{normalized_text}|{category}|{json.dumps(key_attrs, sort_keys=True, default=str)}"
         return hashlib.md5(hash_input.encode()).hexdigest()
     
     def _deduplicate_rules(self, rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -88,154 +91,111 @@ class PolicyParser:
         return unique_rules
     
     def parse_policy(self, policy_text: str, company: str) -> Dict[str, Any]:
-        """Enhanced parsing with better rule extraction"""
+        """
+        OPTIMIZED: Forces extraction of 'Eligible Expenses' and 'Procedural' rules.
+        """
         
-        main_prompt = f"""You are an expert HR policy analyzer. Extract detailed compliance rules from this policy document.
+        main_prompt = f"""
+You are an expert Policy Analyst. Extract a comprehensive list of compliance rules from the text below.
+
+TARGET OUTPUT: A JSON object containing a list of rule objects.
 
 CRITICAL INSTRUCTIONS:
-1. Extract EVERY distinct rule as a SEPARATE item
-2. Differentiate between POSITIVE rules (what's allowed/required) and NEGATIVE rules (what's prohibited)
-3. Each rule = ONE specific constraint or requirement
-4. Assign each rule to appropriate category
-5. Extract ALL attributes mentioned in the policy
+1. **EXTRACT EVERYTHING**:
+   - **Eligible Expenses:** Treat every item in an "Eligible" or "Allowed" list as a separate POSITIVE rule (e.g., "Local transportation is allowed").
+   - **Prohibited Expenses:** Treat every item in a "Non-Reimbursable" list as a separate NEGATIVE rule.
+   - **Procedural Rules:** Extract rules about process (e.g., "Must attach scanned photos", "Must complete Request Form").
+   - **Limits:** Extract currency, amounts, and time limits.
+
+2. **RULE STRUCTURE**:
+   - If the text says "Local transportation (Uber/Ola)", create a rule: {{ "raw_text": "Local transportation (e.g., Uber/Ola, auto, fuel) is eligible", "rule_type": "positive", "category": "Travel" }}
+   - If the text says "Alcoholic beverages", create a rule: {{ "raw_text": "Alcoholic beverages are non-reimbursable", "rule_type": "negative", "category": "Food" }}
+
+3. **ATTRIBUTES**:
+   - If a rule implies a currency (e.g., "₹100"), set "currency": "AED".
+   - Use 'allowed_modes' for specific examples given in positive rules.
 
 STANDARD CATEGORIES:
 Travel, Accommodation, Food, Communication, Medical, Entertainment, Supplies, Training, Other
 
-RULE STRUCTURE:
-{{
-  "rule_id": "unique_id",
-  "category": "one of the standard categories",
-  "rule_type": "positive" (what's allowed/required) or "negative" (what's prohibited),
-  "raw_text": "exact rule text from policy",
-  "attributes": {{
-    "max_amount": number or null,
-    "min_amount": number or null,
-    "currency": "INR|USD|EUR" (only if amount specified),
-    "time_limit_days": number or null (e.g., "within 10 days" → 10),
-    "receipt_required": true|false|null,
-    "approval_required": true|false|null,
-    "conditions": ["list", "of", "conditions"],
-    "allowed_items": ["list"] or null,
-    "disallowed_items": ["list"] or null,
-    "notes": "any other important details"
-  }},
-  "severity": "HIGH" (mandatory/absolute rules) or "MEDIUM" (recommended/conditional),
-  "applies_to": "all_employees"
-}}
-
-IMPORTANT RULES FOR THIS POLICY:
-- "Receipts mandatory above ₹300" = Create ONE rule about receipt requirement with min_amount: 300
-- "Submit within 10 working days" = Create ONE rule about time_limit_days: 10
-- "All reimbursements in INR" = Create ONE rule about currency: "INR"
-- "Pre-approval required" = Create ONE rule about approval_required: true
-- "Personal purchases not reimbursable" = Create ONE rule with rule_type: "negative"
-- "Daily limits may apply" = Create ONE rule noting limits apply (no specific amount)
-
-POLICY DOCUMENT:
+INPUT POLICY:
 {policy_text}
 
-Return ONLY valid JSON in format:
+OUTPUT FORMAT (JSON):
 {{
-  "categories_found": ["list of categories"],
-  "rules": [array of rule objects with all details]
+  "rules": [
+    {{
+      "rule_id": "string",
+      "category": "string",
+      "is_global": boolean,
+      "rule_type": "positive" | "negative",
+      "raw_text": "string (Full sentence describing the rule)",
+      "severity": "HIGH" | "MEDIUM" | "LOW",
+      "attributes": {{
+        "max_amount": number | null,
+        "min_amount": number | null,
+        "currency": "string" | null,
+        "submission_limit_days": number | null,
+        "allowed_modes": ["string"] | null,
+        "disallowed_modes": ["string"] | null,
+        "receipt_required": boolean | null,
+        "approval_required": boolean | null
+      }}
+    }}
+  ]
 }}
-
-IMPORTANT: 
-- Extract each distinct rule separately
-- Include both positive (allowed) and negative (prohibited) rules
-- Be precise with amounts and time limits
-- Keep raw_text as exact quote from policy
 """
 
-        def extract_json_robust(text: str) -> str:
-            """Robust JSON extraction"""
-            text = text.strip()
-            
-            if '```json' in text:
-                parts = text.split('```json', 1)
-                if len(parts) > 1:
-                    return parts[1].split('```', 1)[0].strip()
-            
-            if '```' in text:
-                parts = text.split('```', 1)
-                if len(parts) > 1:
-                    return parts[1].split('```', 1)[0].strip()
-            
-            first_brace = text.find('{')
-            last_brace = text.rfind('}')
-            
-            if first_brace != -1 and last_brace != -1:
-                return text[first_brace:last_brace + 1]
-            
-            return text
-        
         try:
-            logger.info("🔍 Starting rule extraction...")
+            logger.info("🔍 Starting detailed rule extraction...")
             
             response = self.model.generate_content(
                 main_prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.0,
-                    top_p=0.9,
+                    temperature=0.1, # Slightly higher to capture variety
+                    response_mime_type="application/json",
                     max_output_tokens=16384,
                 )
             )
             
-            result_text = response.text.strip()
-            json_text = extract_json_robust(result_text)
-            parsed_data = json.loads(json_text)
-            
+            parsed_data = json.loads(response.text)
             rules = parsed_data.get('rules', [])
+            
             logger.info(f"📊 Initial extraction: {len(rules)} rules")
             
             # Deduplicate
             rules = self._deduplicate_rules(rules)
-            logger.info(f"📊 After deduplication: {len(rules)} unique rules")
             
-            # Validate and enrich
             validated_rules = []
             categories_set = set()
             
             for idx, rule in enumerate(rules):
-                if not rule.get('rule_id'):
-                    rule['rule_id'] = f"r{idx+1}"
-                else:
-                    rule['rule_id'] = f"r{idx+1}"
+                rule['rule_id'] = f"r{idx+1}"
                 
-                category = rule.get('category', 'Other')
-                normalized_category = self._normalize_category(category)
-                rule['category'] = normalized_category
-                categories_set.add(normalized_category)
+                # Normalize Category
+                cat = self._normalize_category(rule.get('category'))
+                rule['category'] = cat
+                categories_set.add(cat)
                 
                 if not rule.get('attributes'):
                     rule['attributes'] = {}
                 
-                attrs = rule['attributes']
-                rule_text_lower = rule.get('raw_text', '').lower()
-                
-                # Only keep currency if amount is specified or currency is mentioned
-                if attrs.get('currency'):
-                    has_amount = attrs.get('max_amount') or attrs.get('min_amount')
-                    mentions_currency = any(keyword in rule_text_lower for keyword in [
-                        'currency', 'inr', 'usd', 'eur', 'aed', 'gbp', '₹', 'rs.', 
-                        'processed in', 'reimbursed in', 'paid in'
-                    ])
-                    
-                    if not (has_amount or mentions_currency):
-                        attrs.pop('currency', None)
-                
-                if attrs.get('currency'):
-                    attrs['currency'] = attrs['currency'].upper()
+                # Cleanup raw_text for negative rules if they are just keywords
+                # Example: If text is just "Alcohol", change to "Alcohol is prohibited"
+                if rule.get('rule_type') == 'negative' and len(rule.get('raw_text', '').split()) < 3:
+                     rule['raw_text'] = f"{rule['raw_text']} is prohibited/non-reimbursable"
+
+                # Generate Search Text
+                attrs_str = ", ".join([f"{k}:{v}" for k, v in rule['attributes'].items() if v])
+                rule['search_text'] = (
+                    f"Category: {cat} | "
+                    f"Type: {rule.get('rule_type', 'positive')} | "
+                    f"Rule: {rule.get('raw_text')} | "
+                    f"Limits: {attrs_str}"
+                )
                 
                 if not rule.get('severity'):
                     rule['severity'] = self._infer_severity(rule)
-                
-                if not rule.get('applies_to'):
-                    rule['applies_to'] = 'all_employees'
-                
-                if not rule.get('rule_type'):
-                    rule['rule_type'] = 'positive'
                 
                 rule['company'] = company
                 rule['extracted_at'] = datetime.now(timezone.utc).isoformat()
@@ -250,13 +210,13 @@ IMPORTANT:
                 "total_rules": len(validated_rules)
             }
             
-            logger.info(f"✅ Final: {len(validated_rules)} unique rules across {len(categories_set)} categories")
+            logger.info(f"✅ Final: {len(validated_rules)} unique rules extracted")
             return result
             
         except Exception as e:
             logger.error(f"❌ Error parsing policy: {e}", exc_info=True)
             return self._enhanced_fallback_extraction(policy_text, company)
-    
+        
     def _normalize_category(self, category: str) -> str:
         """Normalize category to standard taxonomy"""
         if not category:

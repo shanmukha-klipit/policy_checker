@@ -529,7 +529,8 @@ async def upload_policy(
 
             logger.info(f"Generating embeddings for {len(rules)} rules...")
             for rule in rules:
-                rule["embedding"] = rag_engine.generate_embedding(rule["raw_text"])
+                text_to_embed = rule.get("search_text", rule["raw_text"])
+                rule["embedding"] = rag_engine.generate_embedding(text_to_embed)
 
             policy_data = {
                 "company": company,
@@ -1178,7 +1179,8 @@ async def update_policy(
                     raise HTTPException(status_code=400, detail="No rules could be extracted from the uploaded file")
 
                 for rule in rules:
-                    rule["embedding"] = rag_engine.generate_embedding(rule["raw_text"])
+                    text_to_embed = rule.get("search_text", rule["raw_text"])
+                    rule["embedding"] = rag_engine.generate_embedding(text_to_embed)
 
                 updated_fields.update({
                     "file_path": file.filename,
