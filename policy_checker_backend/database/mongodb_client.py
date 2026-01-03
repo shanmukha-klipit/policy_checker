@@ -1,5 +1,3 @@
-# database/mongodb_client.py - Fixed fallback logic
-
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 from typing import List, Dict, Any, Optional
@@ -11,23 +9,15 @@ logger = logging.getLogger(__name__)
 
 class MongoDBClient:
     """
-    MongoDB client with dynamic connection switching for different environments
+    MongoDB client with static connection (no dynamic origin-based switching)
     """
     
     def __init__(self, db_name: str = None):
-        # 🆕 FIXED: Better environment configuration loading
-        self.environment_configs = self._load_environment_configs()
-        
-        # 🆕 FIXED: Clear default connection parameters
+        # ✅ ROLLBACK: Use default connection only
         self.default_mongo_uri = os.getenv("MONGODB_URI")
-        self.default_db_name = self._get_default_db_name(db_name)
-        
-        # Validate that we have at least default connection
-        if not self.default_mongo_uri:
-            raise ValueError("MONGODB_URI environment variable is required")
+        self.default_db_name = db_name or os.getenv("MONGODB_DB_NAME", "klipit")
         
         # Current connection state
-        self.current_env = 'default'
         self.client = None
         self.db = None
         
@@ -38,7 +28,7 @@ class MongoDBClient:
         self.policy_rules = self.db['policy_rules']
         self.compliance_checks = self.db['compliance_checks']
         
-        # Request metadata
+        # Request metadata (kept for logging but not used for DB switching)
         self.origin = None
         self.referer = None
         self.client_ip = None
@@ -46,74 +36,8 @@ class MongoDBClient:
         # Create indexes
         self._create_indexes()
         
-        logger.info(f"✅ MongoDB client initialized with default database: {self.default_db_name}")
-        logger.info(f"🌍 Available environments: {list(self.environment_configs.keys())}")
-        logger.info(f"🔧 Default MongoDB URI: {self._mask_mongo_uri(self.default_mongo_uri)}")
-    
-    def _load_environment_configs(self) -> Dict[str, Any]:
-        """Load and validate environment configurations"""
-        configs = {
-            'dev': {
-                'web_origins': [os.getenv("DB_MAP_DEV_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_DEV_MOBILE")],
-                'db_name': os.getenv("DB_NAME_DEV"),
-                'mongo_uri': os.getenv("MONGODB_URI_DEV")
-            },
-            'staging': {
-                'web_origins': [os.getenv("DB_MAP_STAGING_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_STAGING_MOBILE")],
-                'db_name': os.getenv("DB_NAME_STAGING"),
-                'mongo_uri': os.getenv("MONGODB_URI_STAGING")
-            },
-            'prod': {
-                'web_origins': [os.getenv("DB_MAP_PROD_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_PROD_MOBILE")],
-                'db_name': os.getenv("DB_NAME_PROD"),
-                'mongo_uri': os.getenv("MONGODB_URI_PROD")
-            }
-        }
-        
-        # Remove environments with incomplete configuration
-        valid_configs = {}
-        for env, config in configs.items():
-            # Check if this environment has both mongo_uri and db_name
-            has_mongo_uri = bool(config.get('mongo_uri'))
-            has_db_name = bool(config.get('db_name'))
-            has_origins = bool(config.get('web_origins') or config.get('mobile_origins'))
-            
-            if has_mongo_uri and has_db_name:
-                valid_configs[env] = config
-                logger.info(f"   ✅ {env.upper()}: {config['db_name']}")
-            else:
-                logger.warning(f"   ⚠️ {env.upper()}: Incomplete configuration (missing URI or DB name)")
-        
-        return valid_configs
-    
-    def _get_default_db_name(self, db_name: str = None) -> str:
-        """Get the default database name with proper fallback logic"""
-        # Priority: 1. Provided db_name, 2. MONGODB_DB_NAME env, 3. Fallback to "klipit"
-        if db_name:
-            return db_name
-        
-        env_db_name = os.getenv("MONGODB_DB_NAME")
-        if env_db_name:
-            return env_db_name
-        
-        logger.warning("⚠️ No MONGODB_DB_NAME set, using default 'klipit'")
-        return "klipit"
-    
-    def _mask_mongo_uri(self, mongo_uri: str) -> str:
-        """Mask MongoDB URI for safe logging"""
-        if not mongo_uri:
-            return "None"
-        # Keep only the protocol and host, mask credentials
-        try:
-            parts = mongo_uri.split('@')
-            if len(parts) > 1:
-                return f"{parts[0].split('//')[0]}//***@***" + parts[1].split('/')[0]
-        except:
-            pass
-        return "***masked***"
+        logger.info(f"✅ MongoDB client initialized with database: {self.default_db_name}")
+        logger.info(f"🔗 MongoDB URI: {self.default_mongo_uri[:50]}...")
     
     def _initialize_connection(self, mongo_uri: str, db_name: str):
         """Initialize or reinitialize MongoDB connection"""
@@ -122,39 +46,15 @@ class MongoDBClient:
             if self.client:
                 self.client.close()
             
-            # Validate parameters
-            if not mongo_uri:
-                raise ValueError("MongoDB URI cannot be empty")
-            if not db_name:
-                raise ValueError("Database name cannot be empty")
-            
             # Create new connection
             self.client = MongoClient(mongo_uri)
             self.db = self.client[db_name]
             
-            # Test connection
-            self.client.admin.command('ping')
-            
             logger.info(f"🔗 MongoDB connected to: {db_name}")
-            logger.debug(f"   URI: {self._mask_mongo_uri(mongo_uri)}")
             
         except Exception as e:
             logger.error(f"❌ Failed to connect to MongoDB: {e}")
-            
-            # Fallback to default connection only if this wasn't already the default
-            if mongo_uri != self.default_mongo_uri or db_name != self.default_db_name:
-                logger.info("🔄 Falling back to default MongoDB connection")
-                try:
-                    self.client = MongoClient(self.default_mongo_uri)
-                    self.db = self.client[self.default_db_name]
-                    self.client.admin.command('ping')  # Test default connection
-                    logger.info(f"✅ Fallback successful to: {self.default_db_name}")
-                except Exception as fallback_error:
-                    logger.error(f"❌ Fallback connection also failed: {fallback_error}")
-                    raise fallback_error
-            else:
-                # This was already the default connection, no fallback possible
-                raise
+            raise
     
     def _create_indexes(self):
         """Create necessary indexes for efficient queries."""
@@ -174,129 +74,8 @@ class MongoDBClient:
             logger.info("✅ Database indexes created successfully")
         except Exception as e:
             logger.warning(f"⚠️ Index creation warning: {e}")
-    
-    def _detect_environment_from_origin(self, origin: str) -> str:
-        """
-        Detect environment from origin
-        Returns: 'dev', 'staging', 'prod', or 'default'
-        """
-        if not origin:
-            logger.debug("No origin provided, using default environment")
-            return 'default'
-        
-        origin_lower = origin.lower()
-        logger.debug(f"Detecting environment for origin: {origin}")
-        
-        # Check each environment's origins
-        for env, config in self.environment_configs.items():
-            # Check web origins
-            web_origins = config.get('web_origins', [])
-            for web_origin in web_origins:
-                if web_origin and web_origin.lower() in origin_lower:
-                    logger.debug(f"Matched web origin: {web_origin} -> {env}")
-                    return env
-            
-            # Check mobile origins
-            mobile_origins = config.get('mobile_origins', [])
-            for mobile_origin in mobile_origins:
-                if mobile_origin and mobile_origin.lower() in origin_lower:
-                    logger.debug(f"Matched mobile origin: {mobile_origin} -> {env}")
-                    return env
-        
-        # Specific pattern matching as fallback
-        if "localhost" in origin_lower:
-            logger.debug("Matched localhost pattern -> dev")
-            return 'dev'
-        elif "dev" in origin_lower:
-            logger.debug("Matched dev pattern -> dev")
-            return 'dev'
-        elif "staging" in origin_lower:
-            logger.debug("Matched staging pattern -> staging")
-            return 'staging'
-        elif "business.klipit.co" in origin_lower and "staging" not in origin_lower:
-            logger.debug("Matched production pattern -> prod")
-            return 'prod'
-        
-        logger.debug(f"No environment match found for origin: {origin}, using default")
-        return 'default'
-    
-    def switch_db_based_on_origin(self, origin: str):
-        """
-        🆕 FIXED: Switch database connection based on origin with better fallback
-        """
-        if not origin:
-            logger.warning("⚠️ No origin provided, using default connection")
-            return
-        
-        # Detect environment from origin
-        detected_env = self._detect_environment_from_origin(origin)
-        
-        # If already connected to the correct environment, do nothing
-        if detected_env == self.current_env:
-            logger.debug(f"✅ Already connected to {detected_env} environment")
-            return
-        
-        # Get environment configuration
-        env_config = self.environment_configs.get(detected_env)
-        
-        if env_config and detected_env != 'default':
-            # Switch to environment-specific connection
-            mongo_uri = env_config.get('mongo_uri')
-            db_name = env_config.get('db_name')
-            
-            if not mongo_uri or not db_name:
-                logger.error(f"❌ Incomplete configuration for {detected_env} environment")
-                self._fallback_to_default(f"Incomplete {detected_env} configuration")
-                return
-            
-            try:
-                logger.info(f"🔄 Switching to {detected_env.upper()} environment...")
-                self._initialize_connection(mongo_uri, db_name)
-                self.current_env = detected_env
-                
-                # Update collections reference
-                self.policy_rules = self.db['policy_rules']
-                self.compliance_checks = self.db['compliance_checks']
-                
-                logger.info(f"✅ Switched to {detected_env.upper()} environment")
-                logger.info(f"   Database: {db_name}")
-                logger.info(f"   Origin: {origin}")
-                
-            except Exception as e:
-                logger.error(f"❌ Failed to switch to {detected_env} environment: {e}")
-                self._fallback_to_default(f"Switch to {detected_env} failed: {str(e)}")
-        else:
-            # Use default connection for unknown origins or 'default' environment
-            if self.current_env != 'default':
-                self._fallback_to_default(f"Unknown origin: {origin}")
-            else:
-                logger.debug(f"✅ Using default connection for origin: {origin}")
-    
-    def _fallback_to_default(self, reason: str):
-        """Fallback to default connection"""
-        logger.warning(f"🔄 Falling back to default connection: {reason}")
-        try:
-            self._initialize_connection(self.default_mongo_uri, self.default_db_name)
-            self.current_env = 'default'
-            logger.info(f"✅ Successfully fell back to default database: {self.default_db_name}")
-        except Exception as e:
-            logger.error(f"❌ Critical: Fallback to default connection also failed: {e}")
-            # At this point, we can't recover - the application should probably restart
-    
-    # 🆕 NEW: Method to get current connection info
-    def get_connection_info(self) -> Dict[str, Any]:
-        """Get current connection information"""
-        return {
-            'environment': self.current_env,
-            'database': self.db.name if self.db else 'unknown',
-            'origin': self.origin,
-            'default_database': self.default_db_name,
-            'available_environments': list(self.environment_configs.keys())
-        }
-    # ============================================================================
-    # EXISTING METHODS - Keep all your existing functionality
-    # ============================================================================
-    
+
+
     def store_policy(self, policy_data: Dict[str, Any]) -> bool:
         """
         Store complete policy information in a single document.
@@ -484,17 +263,16 @@ class MongoDBClient:
     def get_statistics(self, company: str) -> Dict[str, Any]:
         """
         Get comprehensive statistics for a company.
-        ✅ UPDATED: Uses status field for active policy detection
         """
         try:
             # Get policy stats
             policy = self.get_policy(company)
             policy_stats = {
-                "has_active_policy": policy is not None and policy.get('status') == 'active',  # ✅ UPDATED
+                "has_active_policy": policy is not None and policy.get('status') == 'active',
                 "total_rules": policy.get('total_rules', 0) if policy else 0,
                 "categories": policy.get('categories', []) if policy else [],
                 "policy_name": policy.get('policy_name', 'N/A') if policy else 'N/A',
-                "status": policy.get('status', 'inactive') if policy else 'inactive'  # ✅ UPDATED
+                "status": policy.get('status', 'inactive') if policy else 'inactive'
             }
             
             # Get compliance check stats
@@ -659,7 +437,6 @@ class MongoDBClient:
     def list_policies(self, company: str) -> List[Dict[str, Any]]:
         """
         List all policies for a company with summary information.
-        ✅ UPDATED: Returns status field instead of effective dates
         """
         try:
             policies = list(
@@ -668,7 +445,7 @@ class MongoDBClient:
                     {
                         "policy_name": 1,
                         "time_uploaded": 1,
-                        "status": 1,  # ✅ UPDATED: Return status instead of dates
+                        "status": 1,
                         "total_rules": 1,
                         "categories": 1,
                         "_id": 0
@@ -683,7 +460,6 @@ class MongoDBClient:
     def get_policies_by_company(self, company: str):
         """
         Fetch all policy documents for a company.
-        ✅ UPDATED: Returns status field instead of effective dates
         """
         try:
             # Use policy_rules collection instead of policies
@@ -693,7 +469,7 @@ class MongoDBClient:
                     "_id": 1,
                     "policy_name": 1,
                     "description": 1,
-                    "status": 1,  # ✅ UPDATED: Fetch status instead of dates
+                    "status": 1,
                     "categories": 1,
                     "total_rules": 1,
                     "last_updated": 1,
@@ -707,7 +483,7 @@ class MongoDBClient:
                 formatted_policy = {
                     "policy_name": policy.get("policy_name"),
                     "description": policy.get("description", ""),
-                    "status": policy.get("status", "inactive"),  # ✅ UPDATED: Use status field
+                    "status": policy.get("status", "inactive"),
                     "total_rules": policy.get("total_rules", 0),
                     "categories": policy.get("categories", []),
                     "last_updated": policy.get("last_updated") or policy.get("time_uploaded"),
@@ -736,10 +512,9 @@ class MongoDBClient:
     def update_policy(self, company: str, policy_name: str, updated_fields: dict):
         """
         Update a policy with new fields.
-        ✅ UPDATED: Validates status field if provided
         """
         try:
-            # ✅ UPDATED: Validate status if being updated
+            # Validate status if being updated
             if 'status' in updated_fields:
                 if updated_fields['status'] not in ['active', 'inactive']:
                     logger.warning(f"Invalid status value: {updated_fields['status']}, defaulting to 'inactive'")
@@ -787,21 +562,21 @@ class MongoDBClient:
                 logger.warning(f"Expense not found with ID: {expense_id}")
                 return None
             
-            # ✅ FIX: Process items to convert ObjectIds to strings
+            # Process items to convert ObjectIds to strings
             items = []
             for item in expense.get("items", []):
                 processed_item = {
                     "name": item.get("name", ""),
                     "amount": item.get("amount", 0),
                     "category": item.get("category", "Other"),
-                    "quantity": item.get("quantity", 1),  # Add if exists
+                    "quantity": item.get("quantity", 1),
                 }
                 # Convert item _id if it exists
                 if "_id" in item:
                     processed_item["_id"] = str(item["_id"])
                 items.append(processed_item)
             
-            # ✅ FIX: Convert ObjectId fields in breakdown if present
+            # Process breakdown if present
             breakdown = []
             for b in expense.get("breakdown", []):
                 breakdown_item = {
@@ -812,12 +587,12 @@ class MongoDBClient:
                     breakdown_item["category"] = str(b["category"])
                 breakdown.append(breakdown_item)
             
-            # ✅ FIX: Handle customer ObjectId
+            # Handle customer ObjectId
             customer_id = expense.get("customer")
             if isinstance(customer_id, ObjectId):
                 customer_id = str(customer_id)
             
-            # ✅ FIX: Handle pdfBase64Data ObjectId
+            # Handle pdfBase64Data ObjectId
             pdf_data_id = expense.get("pdfBase64Data")
             if isinstance(pdf_data_id, ObjectId):
                 pdf_data_id = str(pdf_data_id)
@@ -826,25 +601,25 @@ class MongoDBClient:
             expense_data = {
                 "_id": str(expense.get("_id")),
                 "title": expense.get("title", "Unknown Vendor"),
-                "date": expense.get("date"),  # datetime object
+                "date": expense.get("date"),
                 "currency": expense.get("currency", "INR"),
                 "originalAmount": expense.get("originalAmount", 0),
                 "totalAmount": expense.get("totalAmount", 0),
                 "convertedCurrency": expense.get("convertedCurrency"),
                 "convertedAmount": expense.get("convertedAmount"),
-                "items": items,  # ✅ Processed items
+                "items": items,
                 "receiptId": expense.get("receiptId"),
                 "retailer": expense.get("retailer") or expense.get("title", "Unknown Vendor"),
                 "time": expense.get("time"),
                 "fileUrl": expense.get("fileUrl"),
                 "status": expense.get("status", "pending"),
                 "numberOfItems": expense.get("numberOfItems", len(items)),
-                "breakdown": breakdown,  # ✅ Processed breakdown
+                "breakdown": breakdown,
                 "customer": customer_id,
                 "pdfBase64Data": pdf_data_id,
-                "paymentMode": expense.get("paymentMode", "N/A"),  # Optional field
-                "origin": expense.get("origin"),  # Optional field
-                "destination": expense.get("destination"),  # Optional field,
+                "paymentMode": expense.get("paymentMode", "N/A"),
+                "origin": expense.get("origin"),
+                "destination": expense.get("destination"),
             }
             
             logger.info(

@@ -1,7 +1,3 @@
-# main_url_optimized.py - FastAPI Backend with URL Support for Bills
-# ✅ UPDATED: Status-based policy management (removed effective_from/effective_to)
-# ✅ UPDATED: Dynamic database switching for both MongoDBClient and RAGEngine
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -67,53 +63,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Request logging middleware
+# Request logging middleware (simplified - no DB switching)
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
 
+    origin = request.headers.get("origin", "unknown")
     logger.info(
-        f"⚡ {request.method} {request.url.path} "
+        f"⚡ {request.method} {request.url.path} from {origin} "
         f"completed in {process_time:.2f}s with status {response.status_code}"
     )
 
     gc.collect()
-    return response
-
-# 🆕 ENHANCED: Origin-based DB switching middleware for both MongoDBClient and RAGEngine
-@app.middleware("http")
-async def capture_origin_and_switch_db(request: Request, call_next):
-    """
-    🆕 ENHANCED: Capture the frontend origin from request headers and switch DB for both MongoDBClient and RAGEngine.
-    This runs before every request to ensure both services use the correct database.
-    """
-    origin = request.headers.get("origin")
-    referer = request.headers.get("referer")
-    client_ip = request.client.host if request.client else None
-
-    # Switch MongoDBClient database
-    if db_client:
-        # Store request metadata
-        db_client.origin = origin
-        db_client.referer = referer
-        db_client.client_ip = client_ip
-
-        # 🔄 Dynamically switch database based on origin
-        db_client.switch_db_based_on_origin(origin)
-    
-    # 🆕 NEW: Switch RAGEngine database
-    if rag_engine and origin:
-        rag_engine.switch_database(origin)
-        
-    logger.info(
-        f"🌍 Request from origin={origin}, referer={referer}, "
-        f"ip={client_ip}, path={request.url.path}, "
-        f"DB switched for both MongoDBClient and RAGEngine"
-    )
-
-    response = await call_next(request)
     return response
 
 # Initialize services
@@ -137,8 +100,8 @@ async def startup_event():
         policy_parser = PolicyParser()
         bill_parser = BillParser()
         
-        # ✅ Initialize RAGEngine without origin first (will switch dynamically in middleware)
-        rag_engine = RAGEngine(origin=None)
+        # Initialize RAGEngine with static connection (no dynamic switching)
+        rag_engine = RAGEngine()
         
         compliance_checker = ComplianceChecker()
         db_client = MongoDBClient()
@@ -149,7 +112,7 @@ async def startup_event():
 
         logger.info("✅ URL-ENABLED application started successfully")
         logger.info("📁 Supported sources: File Upload, Google Drive, AWS S3, Direct URLs")
-        logger.info("🔄 Dynamic database switching: ENABLED for both MongoDBClient and RAGEngine")
+        logger.info("🔗 Using static MongoDB connection (single database)")
     except Exception as e:
         logger.error(f"Error during startup: {e}")
         raise
@@ -181,9 +144,6 @@ class BillCheckExpenseRequest(BaseModel):
     expense_id: str
     policy_name: Optional[str] = None
 
-# ============================================================================
-# ✅ FIXED: Expense JSON → Bill Facts Conversion Helpers
-# ============================================================================
 
 def format_date(date_value) -> str:
     """
@@ -393,11 +353,7 @@ def convert_expense_to_bill_facts(expense: Dict[str, Any]) -> Dict[str, Any]:
     
     return bill_facts
 
-# ============================================================================
-# END: Helper Functions
-# ============================================================================
 
-# Helper Functions
 async def validate_file_size(file: UploadFile) -> int:
     """Validate uploaded file size"""
     file.file.seek(0, 2)
@@ -442,8 +398,8 @@ async def root():
             "Direct HTTP/HTTPS URLs",
             "Batch LLM processing (80% faster)",
             "✅ Direct JSON expense conversion",
-            "✅ Status-based policy management (NEW)",
-            "🔄 Dynamic multi-database support (NEW)"
+            "✅ Status-based policy management",
+            "✅ Static MongoDB connection (single database)"
         ]
     }
 
@@ -468,10 +424,11 @@ async def health_check():
         "status": "healthy" if db_status == "connected" else "degraded",
         "environment": ENVIRONMENT,
         "database": db_status,
+        "database_name": db_client.default_db_name if db_client else "unknown",
         "pdf_sources": pdf_capabilities,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "optimized": True,
-        "dynamic_db": True
+        "dynamic_db": False
     }
 
 @app.post("/api/policy/upload")
@@ -484,12 +441,12 @@ async def upload_policy(
 ):
     """
     Upload and process policy.
-    ✅ UPDATED: Uses status field (active/inactive), defaults to 'inactive' if not provided
+    Uses status field (active/inactive), defaults to 'inactive' if not provided
     """
     try:
         logger.info(f"⚡ Processing policy upload for company: {company}")
 
-        # ✅ Default status to 'inactive' if not provided
+        # Default status to 'inactive' if not provided
         if not status:
             status = "inactive"
             logger.info("Status not provided, defaulting to 'inactive'")
@@ -529,8 +486,7 @@ async def upload_policy(
 
             logger.info(f"Generating embeddings for {len(rules)} rules...")
             for rule in rules:
-                text_to_embed = rule.get("search_text", rule["raw_text"])
-                rule["embedding"] = rag_engine.generate_embedding(text_to_embed)
+                rule["embedding"] = rag_engine.generate_embedding(rule["raw_text"])
 
             policy_data = {
                 "company": company,
@@ -538,7 +494,7 @@ async def upload_policy(
                 "policy_name": policy_name,
                 "description": description or "",
                 "rules_extracted": rules,
-                "status": status,  # ✅ UPDATED: Store status instead of dates
+                "status": status,
                 "categories": categories,
                 "embeddings_model": "models/text-embedding-004",
                 "total_rules": len(rules),
@@ -559,7 +515,7 @@ async def upload_policy(
                     "company": company,
                     "policy_name": policy_name,
                     "description": description,
-                    "policy_status": status,  # ✅ UPDATED: Return status
+                    "policy_status": status,
                     "rules_count": len(rules),
                     "rules_extracted": rules,
                     "categories": categories,
@@ -730,7 +686,7 @@ async def check_bill_from_expense(request: BillCheckExpenseRequest):
 @app.post("/api/bill/check/url")
 async def check_bill_from_url(request: BillCheckURLRequest):
     """
-    🆕 NEW: Check bill compliance from URL (Google Drive, S3, or direct URL).
+    Check bill compliance from URL (Google Drive, S3, or direct URL).
     
     Supports:
     - Google Drive: https://drive.google.com/file/d/FILE_ID/view
@@ -949,7 +905,7 @@ async def check_bill_from_file(
 @app.post("/api/bill/validate-url")
 async def validate_bill_url(url: str = Form(...)):
     """
-    🆕 NEW: Validate if a URL is accessible and supported.
+    Validate if a URL is accessible and supported.
     Use this to check URLs before attempting to process them.
     """
     try:
@@ -1031,7 +987,7 @@ async def delete_policy(company: str):
 async def list_company_policies(company: str):
     """
     Get all policies for a company (name, description, status, etc.)
-    ✅ UPDATED: Returns status field instead of effective dates
+    Returns status field instead of effective dates
     """
     try:
         policies = db_client.get_policies_by_company(company)
@@ -1049,14 +1005,13 @@ async def list_company_policies(company: str):
         response = []
         
         for p in policies:
-            # ✅ UPDATED: Use status directly from DB
             status = p.get("status", "inactive")  # Default to inactive if not set
             
             response.append(
                 {
                     "policy_name": p.get("policy_name"),
                     "description": p.get("description", ""),
-                    "status": status,  # ✅ UPDATED: Direct status field
+                    "status": status,
                     "total_rules": p.get("total_rules", 0),
                     "categories": p.get("categories", []),
                     "last_updated": p.get(
@@ -1085,7 +1040,7 @@ async def list_company_policies(company: str):
 async def get_policy_by_name(company: str, policy_name: str):
     """
     Get a specific policy for a company
-    ✅ UPDATED: Returns status field instead of effective dates
+    Returns status field instead of effective dates
     """
     try:
         policy = db_client.get_policy_by_name(company, policy_name)
@@ -1095,14 +1050,13 @@ async def get_policy_by_name(company: str, policy_name: str):
                 detail=f"Policy '{policy_name}' not found for company '{company}'"
             )
 
-        # ✅ UPDATED: Use status directly from DB
         status = policy.get("status", "inactive")  # Default to inactive if not set
 
         return JSONResponse({
             "company": company,
             "policy_name": policy.get("policy_name"),
             "description": policy.get("description", ""),
-            "status": status,  # ✅ UPDATED: Direct status field
+            "status": status,
             "total_rules": policy.get("total_rules", 0),
             "categories": policy.get("categories", []),
             "rules_extracted": policy.get("rules_extracted", []),
@@ -1126,7 +1080,7 @@ async def update_policy(
 ):
     """
     Update an existing policy:
-    ✅ UPDATED: Uses status field (active/inactive) instead of effective dates
+    Uses status field (active/inactive) instead of effective dates
     - If JSON fields are given (description, status): only update those.
     - If file is provided: re-extract rules, categories, and embeddings (like upload),
       and replace those fields in DB.
@@ -1146,7 +1100,7 @@ async def update_policy(
         if description is not None:
             updated_fields["description"] = description
         
-        # ✅ UPDATED: Handle status field with validation
+        # Handle status field with validation
         if status is not None:
             if status not in ["active", "inactive"]:
                 raise HTTPException(
@@ -1155,7 +1109,7 @@ async def update_policy(
                 )
             updated_fields["status"] = status
 
-        # 🔄 File reprocessing
+        # File reprocessing
         if file:
             logger.info(f"Re-uploading file for policy '{policy_name}' to re-extract rules")
             file_size = await validate_file_size(file)
@@ -1179,8 +1133,7 @@ async def update_policy(
                     raise HTTPException(status_code=400, detail="No rules could be extracted from the uploaded file")
 
                 for rule in rules:
-                    text_to_embed = rule.get("search_text", rule["raw_text"])
-                    rule["embedding"] = rag_engine.generate_embedding(text_to_embed)
+                    rule["embedding"] = rag_engine.generate_embedding(rule["raw_text"])
 
                 updated_fields.update({
                     "file_path": file.filename,
@@ -1202,15 +1155,14 @@ async def update_policy(
 
         updated_policy = db_client.get_policy_by_name(company, policy_name)
 
-        # ✅ UPDATED: Use status directly from DB
         final_status = updated_policy.get("status", "inactive")
 
-        # ✅ Return in SAME format as get_policy_by_name
+        # Return in SAME format as get_policy_by_name
         return JSONResponse({
             "company": company,
             "policy_name": updated_policy.get("policy_name"),
             "description": updated_policy.get("description", ""),
-            "status": final_status,  # ✅ UPDATED: Direct status field
+            "status": final_status,
             "total_rules": updated_policy.get("total_rules", 0),
             "categories": updated_policy.get("categories", []),
             "rules_extracted": updated_policy.get("rules_extracted", []),
@@ -1227,7 +1179,7 @@ async def update_policy(
 @app.get("/api/policy/{company}/{policy_name}/rules/list")
 async def get_policy_rules_list(company: str, policy_name: str):
     """
-    🧾 Get only the text list of rules for a specific policy in a company.
+    Get only the text list of rules for a specific policy in a company.
     Returns an array of rule strings instead of full rule objects.
     """
     try:

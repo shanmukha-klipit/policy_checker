@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class RAGEngine:
     """
-    Optimized RAG Engine with consistent dynamic MongoDB connections
+    RAG Engine with static MongoDB connection (no dynamic origin-based switching)
     """
     
     def __init__(self, origin: str = None):
@@ -32,194 +32,27 @@ class RAGEngine:
         logger.info(f"Using LLM model: {self.model_name}")
         logger.info(f"Using embedding model: {self.embedding_model}")
 
-        # 🆕 FIXED: Initialize with consistent connection logic
-        self.origin = origin
-        self.mongo_client = None
-        self.db = None
-        self.rules_collection = None
-        self.current_env = 'default'
+        self._initialize_static_connection()
         
-        self._initialize_dynamic_connection(origin)
-        
-        logger.info(f"✅ RAG Engine initialized for origin: {origin or 'default'}")
+        logger.info(f"✅ RAG Engine initialized with static MongoDB connection")
 
-    def _load_environment_configs(self) -> Dict[str, Any]:
-        """Load and validate environment configurations (same as MongoDB client)"""
-        configs = {
-            'dev': {
-                'web_origins': [os.getenv("DB_MAP_DEV_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_DEV_MOBILE")],
-                'db_name': os.getenv("DB_NAME_DEV"),
-                'mongo_uri': os.getenv("MONGODB_URI_DEV")
-            },
-            'staging': {
-                'web_origins': [os.getenv("DB_MAP_STAGING_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_STAGING_MOBILE")],
-                'db_name': os.getenv("DB_NAME_STAGING"),
-                'mongo_uri': os.getenv("MONGODB_URI_STAGING")
-            },
-            'prod': {
-                'web_origins': [os.getenv("DB_MAP_PROD_WEB")],
-                'mobile_origins': [os.getenv("DB_MAP_PROD_MOBILE")],
-                'db_name': os.getenv("DB_NAME_PROD"),
-                'mongo_uri': os.getenv("MONGODB_URI_PROD")
-            }
-        }
-        
-        # Remove environments with incomplete configuration
-        valid_configs = {}
-        for env, config in configs.items():
-            has_mongo_uri = bool(config.get('mongo_uri'))
-            has_db_name = bool(config.get('db_name'))
-            
-            if has_mongo_uri and has_db_name:
-                valid_configs[env] = config
-            else:
-                logger.warning(f"RAG Engine: ⚠️ {env.upper()} environment configuration incomplete")
-        
-        return valid_configs
-
-    def _get_default_db_name(self) -> str:
-        """Get the default database name with proper fallback logic"""
-        env_db_name = os.getenv("MONGODB_DB_NAME")
-        if env_db_name:
-            return env_db_name
-        
-        logger.warning("RAG Engine: ⚠️ No MONGODB_DB_NAME set, using default 'klipit'")
-        return "klipit"
-
-    def _detect_environment_from_origin(self, origin: str) -> str:
-        """
-        Detect environment from origin (consistent with MongoDB client)
-        Returns: 'dev', 'staging', 'prod', or 'default'
-        """
-        if not origin:
-            return 'default'
-        
-        origin_lower = origin.lower()
-        
-        # Check environment configurations
-        environment_configs = self._load_environment_configs()
-        for env, config in environment_configs.items():
-            # Check web origins
-            web_origins = config.get('web_origins', [])
-            for web_origin in web_origins:
-                if web_origin and web_origin.lower() in origin_lower:
-                    return env
-            
-            # Check mobile origins
-            mobile_origins = config.get('mobile_origins', [])
-            for mobile_origin in mobile_origins:
-                if mobile_origin and mobile_origin.lower() in origin_lower:
-                    return env
-        
-        # Pattern matching fallback
-        if "localhost" in origin_lower:
-            return 'dev'
-        elif "dev" in origin_lower:
-            return 'dev'
-        elif "staging" in origin_lower:
-            return 'staging'
-        elif "business.klipit.co" in origin_lower and "staging" not in origin_lower:
-            return 'prod'
-        
-        return 'default'
-
-    def _initialize_dynamic_connection(self, origin: str = None):
-        """Initialize MongoDB connection with consistent fallback logic"""
-        # Default connection parameters
+    def _initialize_static_connection(self):
+        """Initialize MongoDB connection with default settings"""
         default_mongo_uri = os.getenv("MONGODB_URI")
-        default_db_name = self._get_default_db_name()
+        default_db_name = os.getenv("MONGODB_DB_NAME", "klipit")
         
-        if not default_mongo_uri:
-            raise ValueError("MONGODB_URI environment variable is required for RAG Engine")
-        
-        # Detect environment
-        detected_env = self._detect_environment_from_origin(origin)
-        
-        # Get environment configuration
-        environment_configs = self._load_environment_configs()
-        env_config = environment_configs.get(detected_env)
-        
-        # Determine connection parameters
-        if env_config and detected_env != 'default':
-            mongo_uri = env_config.get('mongo_uri')
-            db_name = env_config.get('db_name')
-            
-            if not mongo_uri or not db_name:
-                logger.warning(f"RAG Engine: ⚠️ Incomplete configuration for {detected_env}, using default")
-                mongo_uri = default_mongo_uri
-                db_name = default_db_name
-                detected_env = 'default'
-        else:
-            mongo_uri = default_mongo_uri
-            db_name = default_db_name
-            detected_env = 'default'
-        
-        # Initialize connection
         try:
-            # Close existing connection if any
-            if self.mongo_client:
-                self.mongo_client.close()
-            
-            self.mongo_client = MongoClient(mongo_uri)
-            self.db = self.mongo_client[db_name]
+            self.mongo_client = MongoClient(default_mongo_uri)
+            self.db = self.mongo_client[default_db_name]
             self.rules_collection = self.db['policy_rules']
-            self.current_env = detected_env
             
-            # Test connection
-            self.mongo_client.admin.command('ping')
-            
-            logger.info(f"✅ RAG Engine connected to {detected_env.upper()} environment")
-            logger.info(f"   Database: {db_name}")
-            logger.info(f"   Origin: {origin or 'default'}")
+            logger.info(f"✅ RAG Engine connected to MongoDB")
+            logger.info(f"   Database: {default_db_name}")
             
         except Exception as e:
-            logger.error(f"❌ RAG Engine failed to connect to {detected_env.upper()}: {e}")
-            
-            # Fallback to default connection
-            if mongo_uri != default_mongo_uri or db_name != default_db_name:
-                logger.info("RAG Engine: 🔄 Falling back to default connection")
-                try:
-                    self.mongo_client = MongoClient(default_mongo_uri)
-                    self.db = self.mongo_client[default_db_name]
-                    self.rules_collection = self.db['policy_rules']
-                    self.current_env = 'default'
-                    self.mongo_client.admin.command('ping')
-                    logger.info(f"✅ RAG Engine fallback successful to: {default_db_name}")
-                except Exception as fallback_error:
-                    logger.error(f"❌ RAG Engine fallback also failed: {fallback_error}")
-                    raise fallback_error
-            else:
-                raise
+            logger.error(f"❌ Failed to initialize RAG Engine connection: {e}")
+            raise
 
-    def switch_database(self, origin: str):
-        """
-        🆕 FIXED: Switch database connection with consistent logic
-        """
-        logger.info(f"RAG Engine: 🔄 Switching database for origin: {origin}")
-        
-        # If already connected to the correct environment, do nothing
-        detected_env = self._detect_environment_from_origin(origin)
-        if detected_env == self.current_env:
-            logger.debug(f"RAG Engine: ✅ Already connected to {detected_env} environment")
-            return
-        
-        self.origin = origin
-        self._initialize_dynamic_connection(origin)
-
-    def get_connection_info(self) -> Dict[str, Any]:
-        """Get current connection information"""
-        return {
-            'environment': self.current_env,
-            'database': self.db.name if self.db else 'unknown',
-            'origin': self.origin
-        }
-
-    # ============================================================================
-    # ALL YOUR EXISTING RAG METHODS REMAIN EXACTLY THE SAME
-    # ============================================================================
-    
     def generate_embedding(self, text: str, max_retries: int = 3) -> List[float]:
         """
         Generate embedding with exponential backoff and retry logic.
@@ -280,132 +113,112 @@ class RAGEngine:
         company: str,
         bill_embedding: List[float],
         bill_facts: Dict[str, Any],
-        top_k: int = 15, # Increased slightly
+        top_k: int = 10,
         policy_name: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
-        OPTIMIZED: Uses Matrix Operations (100x faster) and Hybrid Filtering (Safe Compliance).
+        Retrieve relevant rules using vector similarity.
+        Better category filtering and fallback handling.
         """
         try:
-            # 1. FETCH RULES (The "SQL" Layer)
             query_filter = {"company": company, "status": "active"}
+            
             if policy_name:
                 query_filter["policy_name"] = policy_name
             
             policy_docs = list(self.rules_collection.find(query_filter))
             
-            # Fallback logic remains same...
             if not policy_docs:
+                logger.warning(f"No active policies found for company={company}, policy_name={policy_name or 'N/A'}")
+                # Try inactive policies as fallback
                 query_filter.pop("status", None)
                 policy_docs = list(self.rules_collection.find(query_filter))
             
             if not policy_docs:
-                logger.warning(f"No policies found for company={company}")
+                logger.warning(f"No policies at all found for company={company}")
                 return []
 
-            # Flatten rules
             all_rules = []
             for doc in policy_docs:
-                if 'rules_extracted' in doc:
-                    all_rules.extend(doc['rules_extracted'])
+                rules = doc.get('rules_extracted', [])
+                if rules:
+                    all_rules.extend(rules)
 
             if not all_rules:
+                logger.warning(f"No rules found in policy documents")
                 return []
 
-            # ---------------------------------------------------------
-            # 🚀 OPTIMIZATION 1: MATRIX VECTORIZATION (Speed)
-            # Instead of looping 500 times, we do 1 math operation.
-            # ---------------------------------------------------------
+            logger.info(f"Collected {len(all_rules)} rules from {len(policy_docs)} policy document(s)")
+
+            # Better category filtering
+            bill_category = bill_facts.get('category', '')
+            if bill_category:
+                # First try exact category match + "Other"
+                filtered_rules = [
+                    rule for rule in all_rules
+                    if rule.get('category') in [bill_category, 'Other']
+                ]
+                
+                # If no matches, keep all rules (don't filter by category)
+                if not filtered_rules:
+                    logger.info(f"No rules found for category '{bill_category}', using all {len(all_rules)} rules")
+                    filtered_rules = all_rules
+                else:
+                    logger.info(f"Filtered to {len(filtered_rules)} rules matching category '{bill_category}'")
+                
+                all_rules = filtered_rules
             
-            # Filter out rules without embeddings to prevent errors
-            valid_rules = [r for r in all_rules if r.get('embedding') and len(r['embedding']) > 0]
-            
-            if not valid_rules:
+            # Score rules safely
+            scored_rules = []
+            for rule in all_rules:
+                if 'embedding' in rule and rule['embedding']:
+                    try:
+                        similarity = self.cosine_similarity(bill_embedding, rule['embedding'])
+                        if similarity >= -1.0 and similarity <= 1.0:  # Valid similarity range
+                            rule['similarity_score'] = similarity
+                            scored_rules.append(rule)
+                    except Exception as e:
+                        logger.warning(f"Skipping rule {rule.get('rule_id')} due to embedding error: {e}")
+
+            if not scored_rules:
+                logger.warning(f"No rules with valid embeddings, returning first {top_k} raw rules")
                 return all_rules[:top_k]
 
-            # Convert list of vectors to a NumPy Matrix
-            # Shape: (Num_Rules, 768)
-            embeddings_matrix = np.array([r['embedding'] for r in valid_rules])
-            bill_vector = np.array(bill_embedding)
-
-            # Calculate Dot Product (Cosine Similarity) for ALL rules instantly
-            # Note: Assumes embeddings are normalized (Gemini/OpenAI usually are). 
-            # If not, you need: dot_product / (norm(A) * norm(B))
-            scores = np.dot(embeddings_matrix, bill_vector)
+            # Sort by similarity
+            scored_rules.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
             
-            # Attach scores to rules
-            for i, rule in enumerate(valid_rules):
-                rule['similarity_score'] = float(scores[i])
+            # Better high-severity boosting
+            high_severity_rules = [r for r in scored_rules if r.get('severity', '').upper() == 'HIGH']
+            top_rules = scored_rules[:top_k]
+            seen_rule_ids = {rule.get('rule_id') for rule in top_rules if rule.get('rule_id')}
 
-            # ---------------------------------------------------------
-            # 🛡️ OPTIMIZATION 2: HYBRID SELECTION (Accuracy)
-            # Ensure we never miss "General" rules or "High Severity" rules
-            # ---------------------------------------------------------
+            # Add HIGH severity rules that didn't make top_k
+            for hs_rule in high_severity_rules:
+                if hs_rule.get('rule_id') not in seen_rule_ids and len(top_rules) < top_k * 1.5:
+                    top_rules.append(hs_rule)
+                    seen_rule_ids.add(hs_rule.get('rule_id'))
+
+            # Proper deduplication
+            seen_texts = {}
+            unique_rules = []
             
-            bill_category = bill_facts.get('category', '').lower()
-            selected_rules = []
-            seen_ids = set()
-
-            # Strategy: We want the union of 3 buckets:
-            # Bucket A: Mandatory Global Rules (Currency, Dates, etc.)
-            # Bucket B: Category Specific Rules (Meals, Taxi)
-            # Bucket C: Semantic Matches (Vector Search results that logic missed)
-
-            # Sort all rules by score first
-            valid_rules.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
-
-            for rule in valid_rules:
-                rule_cat = rule.get('category', '').lower()
-                rule_score = rule.get('similarity_score', 0)
+            for rule in top_rules:
+                rule_text = rule.get('raw_text', '').strip().lower()
                 rule_id = rule.get('rule_id')
                 
-                is_selected = False
-
-                # 1. ALWAYS Keep "General" or "Other" rules (Fixes the INR bug)
-                if rule_cat in ['general', 'other', 'global', 'common']:
-                    is_selected = True
-                
-                # 2. ALWAYS Keep Exact Category Matches
-                elif bill_category and rule_cat == bill_category:
-                    is_selected = True
-                
-                # 3. ALWAYS Keep High Severity Rules (if decently relevant)
-                elif rule.get('severity') == 'HIGH' and rule_score > 0.65:
-                    is_selected = True
-                
-                # 4. Keep Semantic Matches (High Similarity) even if category mismatches
-                # (e.g., Bill is "Uber", Rule is "Transport" - category check fails, but vector works)
-                elif rule_score > 0.72:  # Threshold for semantic relevance
-                    is_selected = True
-
-                # Add to selection
-                if is_selected:
-                    selected_rules.append(rule)
-                    seen_ids.add(rule_id)
-
-            # ---------------------------------------------------------
-            # 🧹 OPTIMIZATION 3: FALLBACK & LIMITS
-            # ---------------------------------------------------------
-
-            # If our strict logic found nothing, fall back to just Top K by score
-            if not selected_rules:
-                logger.info("Hybrid selection found no rules, falling back to Top K vector matches")
-                selected_rules = valid_rules[:top_k]
+                if rule_text not in seen_texts:
+                    seen_texts[rule_text] = rule_id
+                    unique_rules.append(rule)
+                else:
+                    logger.debug(f"Skipping duplicate: {rule_id} (similar to {seen_texts[rule_text]})")
             
-            # If we selected too many (e.g., 100 rules), trim the low-scoring ones
-            # But keep ALL High Severity / General rules if possible.
-            # Only trim "Semantic Matches" that are weak.
-            if len(selected_rules) > top_k * 2:
-                # Re-sort and trim, but this is rare in compliance policies
-                selected_rules = selected_rules[:top_k * 2]
-
-            logger.info(f"⚡ Retrieved {len(selected_rules)} rules (Pool: {len(valid_rules)}) for category '{bill_category}'")
-            return selected_rules
+            logger.info(f"Returning {len(unique_rules)} unique rules after deduplication and severity boosting")
+            return unique_rules
 
         except Exception as e:
             logger.error(f"Error retrieving rules: {e}", exc_info=True)
             return []
-         
+
     def _format_all_rules(self, policy_rules: List[Dict[str, Any]]) -> str:
         """Format rules with clear structure"""
         lines = []
@@ -572,8 +385,6 @@ class RAGEngine:
                 bill_facts.pop('days_since_bill', None)
                 bill_facts.pop('analysis_date', None)
 
-        # bill_description = self._format_bill_details(bill_facts)
-        # rules_text = self._format_all_rules(policy_rules)
         clean_rules = []
         for rule in policy_rules:
             clean_rule = {
@@ -634,7 +445,7 @@ Important:
 
         try:
             model = genai.GenerativeModel(self.model_name)
-            logger.info(f"Sending batch reasoning prompt to LLM for {rules_text} rules")
+            logger.info(f"Sending batch reasoning prompt to LLM for {len(rules_text)} rules")
             
             response = model.generate_content(
                 prompt,
@@ -677,7 +488,7 @@ Important:
                 
                 enriched_results.append(result)
             
-            logger.info(f"Batch analysis complete: {len(enriched_results)} rules checked")
+            logger.info(f"Batch analysis complete: {len(enriched_results)} violations found")
             return enriched_results
 
         except json.JSONDecodeError as e:
